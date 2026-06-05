@@ -71,7 +71,7 @@ func Load() *Config {
 
 		DbHost:     getEnv("DB_HOST", "127.0.0.1"),
 		DbUser:     getEnv("DB_USER", "postgres"),
-		DbPassword: getEnv("DB_PASSWORD", "postgres"),
+		DbPassword: getEnv("DB_PASSWORD", ""),
 		DbName:     getEnv("DB_NAME", "wallet_database"),
 		DbPort:     getEnv("DB_PORT", "5432"),
 	}
