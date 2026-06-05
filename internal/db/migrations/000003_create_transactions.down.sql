@@ -1,0 +1,10 @@
+DROP INDEX IF EXISTS idx_transactions_merchant_from_or_to;
+DROP INDEX IF EXISTS idx_transactions_wallet_from_or_to;
+DROP INDEX IF EXISTS idx_transactions_profile_from_or_to;
+DROP INDEX IF EXISTS idx_transactions_status;
+DROP INDEX IF EXISTS idx_transactions_provider_ref;
+DROP INDEX IF EXISTS idx_transactions_order_id;
+DROP INDEX IF EXISTS idx_transactions_rrn;
+DROP TABLE IF EXISTS transactions CASCADE;
+DROP TYPE IF EXISTS transaction_status;
+DROP TYPE IF EXISTS transaction_type;

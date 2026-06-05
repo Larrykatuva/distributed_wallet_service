@@ -1,0 +1,9 @@
+DROP INDEX IF EXISTS idx_wallets_currency;
+DROP INDEX IF EXISTS idx_wallets_status;
+DROP INDEX IF EXISTS idx_wallets_merchant_id;
+DROP INDEX IF EXISTS idx_wallets_profile_id;
+DROP INDEX IF EXISTS idx_wallets_profile_currency;
+DROP INDEX IF EXISTS idx_wallets_number;
+DROP TABLE IF EXISTS wallets;
+DROP SEQUENCE IF EXISTS wallet_number_seq;
+DROP TYPE IF EXISTS wallet_status;
