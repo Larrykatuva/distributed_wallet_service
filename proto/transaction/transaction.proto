@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package transaction;
+option go_package = "github.com/katuva/wallet/proto/transaction";
+
+service TransactionService {
+  rpc Initiate(InitiateTransactionRequest) returns (InitiateTransactionResponse);
+}
+
+message TransactionEntryDto {
+  string wallet_id  = 1;
+  string action     = 2; // debit | credit
+  double amount     = 3;
+  string purpose    = 4;
+  bool   is_fee     = 5;
+  bool   is_initial = 6;
+}
+
+message InitiateTransactionRequest {
+  string                   type         = 1; // transfer|deposit|withdrawal|payment|reversal|adjustment
+  string                   order_id     = 2;
+  string                   provider_ref = 3;
+  string                   callback_url = 4;
+  double                   total_amount = 5;
+  double                   fee          = 6;
+  string                   currency     = 7;
+  optional string          purpose      = 8;
+  optional string          description  = 9;
+  repeated TransactionEntryDto transfers = 10;
+}
+
+message InitiateTransactionResponse {
+  optional string order_id     = 1;
+  optional string provider_ref = 2;
+  string          rrn          = 3;
+  string          type         = 4;
+  string          status       = 5;
+  string          narration    = 6;
+}

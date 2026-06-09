@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package profile;
+option go_package = "github.com/katuva/wallet/proto/profile";
+
+service ProfileService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+}
+
+message RegisterRequest {
+  string          external_id = 1;
+  string          type        = 2;
+  string          full_name   = 3;
+  string          email       = 4;
+  optional string phone       = 5;
+  optional string metadata    = 6;
+}
+
+message RegisterResponse {
+  string id          = 1;
+  string external_id = 2;
+  string type        = 3;
+  string full_name   = 4;
+  string email       = 5;
+}

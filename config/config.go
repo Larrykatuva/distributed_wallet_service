@@ -13,6 +13,9 @@ type Config struct {
 	// System bootstrapping and startup
 	Port string
 
+	// Grpc Port
+	GrpcPort string
+
 	// Actor System
 	ClusterMode    string // "single" or "cluster"
 	ClusterName    string
@@ -61,7 +64,8 @@ func Load() *Config {
 	loadEnv()
 
 	return &Config{
-		Port: getEnv("PORT", "3000"),
+		Port:     getEnv("PORT", "3003"),
+		GrpcPort: getEnv("GRPC_PORT", "3004"),
 
 		ClusterMode:    getEnv("CLUSTER_MODE", "single"),
 		ClusterName:    getEnv("CLUSTER_NAME", "wallet-cluster"),

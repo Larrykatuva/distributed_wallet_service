@@ -3,18 +3,18 @@ package routers
 import (
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/go-chi/chi/v5"
-	"github.com/katuva/wallet/internal/handlers"
+	"github.com/katuva/wallet/internal/handlers/http"
 	"gorm.io/gorm"
 )
 
 func Router(db *gorm.DB, cluster *cluster.Cluster) *chi.Mux {
 	router := chi.NewRouter()
 
-	transHandler := handlers.NewTransactionHandler(db, cluster)
+	transHandler := http.NewTransactionHandler(db, cluster)
 
-	profileHandler := handlers.NewProfileHandler(db)
+	profileHandler := http.NewProfileHandler(db)
 
-	walletHandler := handlers.NewWalletHandler(db)
+	walletHandler := http.NewWalletHandler(db)
 
 	router.Route("/transaction/", func(trans chi.Router) {
 		trans.Post("/initiate", transHandler.Initiate)
