@@ -1,6 +1,6 @@
 # Distributed Wallet Service
 
-A high-performance distributed wallet payment system built in Go, leveraging the actor model via Proto.Actor for concurrent, lock-free transaction processing.
+A high-performance distributed wallet payment system built in Go, leveraging the actor model via Proto.Actor for concurrent, lock-free transaction processing. Exposes both an HTTP and a gRPC API over the same service layer.
 
 ---
 
@@ -30,6 +30,7 @@ Key characteristics:
 - **Automatic reversal** when any transfer in a transaction fails
 - **Immutable ledger** — every balance change is recorded with before/after balances
 - **Tamper detection** via SHA-256 checksum on every wallet row
+- **Dual API** — HTTP (Chi) and gRPC servers run side by side, both backed by the same service layer
 - **Distributed** — runs as a single node or a multi-node Kubernetes cluster via Proto.Actor
 
 ---
@@ -38,8 +39,9 @@ Key characteristics:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                        HTTP Layer                        │
-│                    (Go Chi Router)                       │
+│            HTTP Layer            │      gRPC Layer      │
+│         (Go Chi Router)          │ (Profile / Wallet /  │
+│                                  │ Transaction Service) │
 └────────────────────────┬────────────────────────────────┘
                          │
 ┌────────────────────────▼────────────────────────────────┐
@@ -108,7 +110,7 @@ A transaction is a collection of transfers — each transfer is a debit or credi
 5. StartTransactionMsg sent to TransactionActor
         │
         ▼
-6. HTTP handler returns 202 Accepted immediately ◄─────────── client unblocked here
+6. HTTP handler returns 200 with the transaction in `pending` state ◄── client unblocked here
         │
         ▼  (async from this point)
 7. TransactionActor updates transaction status → processing
@@ -185,7 +187,7 @@ This means:
 
 ### Non-blocking HTTP responses
 
-The HTTP handler returns `202 Accepted` as soon as the transaction row is written and the `StartTransactionMsg` is dispatched. The client does not wait for wallet processing to complete. This means:
+The HTTP handler returns as soon as the transaction row is written and the `StartTransactionMsg` is dispatched to the cluster — it does not wait for a reply from any `WalletActor`. The client does not wait for wallet processing to complete. This means:
 
 - HTTP threads are never blocked on DB operations inside the actor system
 - The server can handle thousands of concurrent HTTP requests
@@ -210,34 +212,41 @@ After every balance change, a SHA-256 checksum of `wallet_id + balance + version
 ```
 wallet/
 ├── cmd/
-│   ├── main.go              # Entry point — init order: logger → db → migrations → cluster → server
+│   ├── main.go             # Entry point — init order: logger → db → migrations → server
 │   └── servers/
-│       └── server.go        # Chi HTTP server setup
+│       ├── server.go       # Boots cluster, then HTTP + gRPC servers
+│       ├── http.go         # Chi HTTP server setup
+│       └── grpc.go         # gRPC server setup — registers Profile/Wallet/Transaction services
 ├── config/
-│   └── config.go            # Environment variable loading
+│   └── config.go           # Environment variable loading
+├── proto/
+│   ├── profile/            # ProfileService .proto + generated code
+│   ├── wallet/             # WalletService .proto + generated code
+│   └── transaction/        # TransactionService .proto + generated code
 ├── dpk/
-│   ├── logger/              # Structured file + stdout logging
-│   └── utils/               # RRN generation and shared utilities
+│   ├── logger/             # Structured file + stdout logging
+│   ├── cache/              # Redis client wrapper
+│   └── utils/              # RRN generation and shared utilities
 ├── internal/
 │   ├── actors/
-│   │   ├── wallet_actor.go      # WalletActor — balance ops + ledger writes
-│   │   ├── transaction_actor.go # TransactionActor — orchestration + reversal
-│   │   └── messages.go          # All actor message types
+│   │   ├── wallet.go       # WalletActor — balance ops + ledger writes
+│   │   ├── transaction.go  # TransactionActor — orchestration + reversal
+│   │   ├── dead_latter.go  # Dead letter handler
+│   │   └── types.go        # All actor message types
 │   ├── cluster/
-│   │   ├── cluster.go       # Proto.Actor cluster init (automanaged / k8s)
-│   │   └── kind.go          # Kind registration — Wallet, Transaction
+│   │   ├── cluster.go      # Proto.Actor cluster init (automanaged / k8s)
+│   │   └── kinds.go        # Kind registration — Wallet, Transaction
 │   ├── db/
-│   │   ├── connection.go    # GORM PostgreSQL connection
-│   │   ├── migrator.go      # Embedded SQL migration runner
-│   │   └── migrations/      # Ordered .up.sql / .down.sql files
+│   │   ├── connection.go   # GORM PostgreSQL connection
+│   │   ├── migrator.go     # Embedded SQL migration runner
+│   │   └── migrations/     # Ordered .up.sql / .down.sql files
 │   ├── handlers/
-│   │   ├── profile.go
-│   │   ├── wallet.go
-│   │   ├── transaction.go
-│   │   └── validate.go      # Request decoding + validation helpers
-│   ├── models/              # GORM models — Profile, Wallet, Transaction, Ledger
-│   ├── services/            # Business logic layer
-│   └── types/               # DTOs and actor message types
+│   │   ├── http/           # Chi HTTP handlers — profile, wallet, transaction
+│   │   └── grpc/           # gRPC service handlers — profile, wallet, transaction
+│   ├── routers/            # HTTP route registration
+│   ├── models/             # GORM models — Profile, Wallet, Transaction, Ledger
+│   ├── services/           # Business logic layer, shared by HTTP and gRPC handlers
+│   └── types/              # DTOs and actor message types
 └── .env
 ```
 
@@ -266,7 +275,7 @@ Immutable append-only record of every balance change. Each debit or credit write
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - PostgreSQL 14+
 - Docker (optional, for local cluster mode)
 
@@ -280,7 +289,8 @@ cd wallet
 # Copy and configure environment
 cp .env.example .env
 
-# Run the application — migrations run automatically on startup
+# Run the application — migrations run automatically on startup.
+# This starts both the HTTP server and the gRPC server.
 make run
 ```
 
@@ -296,7 +306,8 @@ CLUSTER_MODE=cluster make run
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `3000` | HTTP server port |
+| `PORT` | `3003` | HTTP server port |
+| `GRPC_PORT` | `3004` | gRPC server port |
 | `CLUSTER_MODE` | `single` | `single` for local, `cluster` for k8s |
 | `CLUSTER_NAME` | `wallet-cluster` | Proto.Actor cluster name |
 | `CLUSTER_PORT` | `8090` | Inter-node communication port |
@@ -304,43 +315,45 @@ CLUSTER_MODE=cluster make run
 | `K8S_NAMESPACE` | `default` | Kubernetes namespace for k8s provider |
 | `DB_HOST` | `127.0.0.1` | PostgreSQL host |
 | `DB_PORT` | `5432` | PostgreSQL port |
-| `DB_NAME` | `wallet-database` | Database name |
+| `DB_NAME` | `wallet_database` | Database name |
 | `DB_USER` | `postgres` | Database user |
-| `DB_PASSWORD` | `postgres` | Database password |
+| `DB_PASSWORD` | `` (empty) | Database password |
 
 ---
 
 ## API
 
-### Profiles
+Every resource is available over both HTTP and gRPC, backed by the same service layer. Only `Create`/`Register`/`Initiate` operations exist today — there are no read/list/get endpoints yet.
+
+### HTTP
+
+Mounted under `/v1`.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/v1/profiles` | Create a profile |
-| `GET` | `/v1/profiles/:id` | Get a profile |
+| `POST` | `/v1/profile/register` | Register a profile |
+| `POST` | `/v1/wallet/create` | Create a wallet |
+| `POST` | `/v1/transaction/initiate` | Initiate a transaction |
 
-### Wallets
+### gRPC
 
-| Method | Endpoint | Description |
+Served on `GRPC_PORT`, with server reflection enabled.
+
+| Service | RPC | Description |
 |---|---|---|
-| `POST` | `/v1/wallets` | Create a wallet |
-| `GET` | `/v1/wallets/:id` | Get a wallet |
+| `profile.ProfileService` | `Register` | Register a profile |
+| `wallet.WalletService` | `Create` | Create a wallet |
+| `transaction.TransactionService` | `Initiate` | Initiate a transaction |
 
-### Transactions
+Proto definitions live under `proto/{profile,wallet,transaction}/`.
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/v1/transactions/initiate` | Initiate a transaction |
-| `GET` | `/v1/transactions/:id` | Get transaction status |
-
-### Response codes
+### Response codes (HTTP)
 
 | Code | Meaning |
 |---|---|
-| `200` | Success |
-| `202` | Accepted — transaction is processing asynchronously |
-| `400` | Bad request — malformed JSON |
-| `422` | Unprocessable — validation failed |
+| `200` | Success — for transactions, the transaction was accepted and is processing asynchronously |
+| `400` | Bad request — malformed JSON or business validation failure |
+| `422` | Unprocessable — request validation failed |
 | `500` | Internal server error |
 
 ---
@@ -355,16 +368,17 @@ To roll back, run the corresponding `.down.sql` file manually.
 
 ### Partitioning
 
-`transactions` and `ledgers` are range-partitioned by `created_at` with monthly partitions. Partitions for the current month and the next 3 months are created automatically on startup.
-
-A cron job or `pg_cron` task should create future partitions before month rollover to avoid the `no partition found` error in production.
+`transactions` and `ledgers` are declared `PARTITION BY RANGE (created_at)` in their migrations, but no partition-management logic exists yet — the migrator only creates the partitioned parent tables. Actual partitions must be created manually (or via an external scheduler such as `pg_cron`) before any rows can be inserted; a range-partitioned table with no matching partition rejects inserts.
 
 ```sql
--- Run on the 25th of every month
-SELECT create_monthly_partition('transactions', (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')::DATE);
-SELECT create_monthly_partition('ledgers',      (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')::DATE);
+-- Example: create a monthly partition ahead of time
+CREATE TABLE transactions_2026_08 PARTITION OF transactions
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
+CREATE TABLE ledgers_2026_08 PARTITION OF ledgers
+    FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
 ```
 
 ---
 
-*README last updated: June 2026. More features incoming — this document will be updated with each release.*
+*README last updated: July 2026. More features incoming — this document will be updated with each release.*
