@@ -1,0 +1,31 @@
+# Non-secret configuration consumed by config.Load() (config/config.go).
+# ADVERTISED_HOST and K8S_NAMESPACE are deliberately NOT set here — the
+# Deployment injects them via the Downward API so they always match the
+# pod's actual IP and namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wallet-config
+  namespace: wallet
+data:
+  PORT: "3003"
+  GRPC_PORT: "3004"
+  CLUSTER_MODE: "cluster"
+  CLUSTER_NAME: "wallet-cluster"
+  CLUSTER_PORT: "8090"
+  DB_HOST: "wallet-postgres.wallet.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "wallet_database"
+  DB_USER: "postgres"
+---
+# Mounted into the postgres container at /docker-entrypoint-initdb.d so it runs
+# once on first startup. Required because the migrations (internal/db/migrations)
+# call gen_random_uuid(), which on Postgres < 16 is only available via pgcrypto.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wallet-postgres-init
+  namespace: wallet
+data:
+  00-extensions.sql: |
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;

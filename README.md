@@ -300,6 +300,39 @@ make run
 CLUSTER_MODE=cluster make run
 ```
 
+### Deploying to Kubernetes
+
+Manifests live under [`internal/k8`](internal/k8) and are assembled with `kustomize`: namespace,
+RBAC (for the Proto.Actor k8s cluster provider), config/secrets, a self-contained Postgres
+StatefulSet, and the `wallet` Deployment/Service/Ingress/PDB.
+
+**Local cluster** (e.g. Docker Desktop's Kubernetes, which shares the host Docker daemon —
+no image push needed):
+
+```bash
+make docker-build  # builds the local wallet:latest image the Deployment already points at
+make k8s-apply      # kubectl apply -k internal/k8
+
+kubectl get pods -n wallet -w
+kubectl port-forward -n wallet svc/wallet 3003:3003 3004:3004
+```
+
+**Real cluster**: push the image to a registry, update `image:`/`imagePullPolicy` in
+`internal/k8/05-deployment.yaml` accordingly, and replace the placeholder secret:
+
+```bash
+docker tag wallet ghcr.io/<you>/wallet:latest
+docker push ghcr.io/<you>/wallet:latest
+
+kubectl create secret generic wallet-secrets --namespace wallet \
+  --from-literal=DB_PASSWORD=... --from-literal=POSTGRES_PASSWORD=... \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+make k8s-apply     # kubectl apply -k internal/k8
+make k8s-render    # preview the rendered manifests without applying
+make k8s-delete    # tear the deployment down
+```
+
 ---
 
 ## Configuration

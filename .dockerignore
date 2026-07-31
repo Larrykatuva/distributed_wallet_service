@@ -58,6 +58,7 @@ kenya_gateway
 
 # Kubernetes manifests and docs are not needed inside the image
 k8s/
+internal/k8/
 docs/
 
 # Git metadata

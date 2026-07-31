@@ -1,0 +1,101 @@
+# `image` below defaults to the local `wallet:latest` built by `make docker-build`,
+# for use with a local cluster that shares the host's Docker daemon (e.g. Docker
+# Desktop's Kubernetes). For a real cluster, point this at your pushed image
+# instead (e.g. ghcr.io/<you>/wallet:latest) and set imagePullPolicy: Always.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wallet
+  namespace: wallet
+  labels:
+    app.kubernetes.io/name: wallet
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wallet
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wallet
+        # Matched by the k8s cluster provider (internal/cluster/cluster.go) to
+        # discover peers for CLUSTER_NAME=wallet-cluster.
+        cluster: wallet-cluster
+    spec:
+      serviceAccountName: wallet
+      # Spread replicas across nodes so wallet actor placement is genuinely
+      # distributed rather than co-located on one node.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: wallet
+                topologyKey: kubernetes.io/hostname
+      initContainers:
+        # gorm.Open() does not retry — fail fast here instead of the app
+        # panicking on a nil DB connection during a cold cluster start.
+        - name: wait-for-postgres
+          image: postgres:16
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER"; do
+                echo "waiting for postgres at $DB_HOST:$DB_PORT..."
+                sleep 2
+              done
+          envFrom:
+            - configMapRef:
+                name: wallet-config
+      containers:
+        - name: wallet
+          image: wallet:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3003
+            - name: grpc
+              containerPort: 3004
+            - name: cluster
+              containerPort: 8090
+          envFrom:
+            - configMapRef:
+                name: wallet-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: DB_PASSWORD
+            # Must be the pod's own routable IP — other pods dial this
+            # directly for actor remoting over CLUSTER_PORT.
+            - name: ADVERTISED_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # Keeps K8S_NAMESPACE in sync with wherever this is deployed,
+            # instead of hardcoding "wallet" in the ConfigMap.
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

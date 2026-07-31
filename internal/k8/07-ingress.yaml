@@ -1,0 +1,23 @@
+# Optional — HTTP API only (gRPC needs an ingress controller configured for
+# HTTP/2 + grpc backend protocol, which varies by controller; omitted here).
+# Adjust ingressClassName/host/TLS for your environment, or delete this file.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wallet
+  namespace: wallet
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: wallet.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: wallet
+                port:
+                  name: http

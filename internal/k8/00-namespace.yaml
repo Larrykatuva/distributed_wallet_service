@@ -1,0 +1,6 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wallet
+  labels:
+    app.kubernetes.io/name: wallet

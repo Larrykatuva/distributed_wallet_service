@@ -1,0 +1,33 @@
+# Proto.Actor's k8s cluster provider (internal/cluster/cluster.go -> clusterproviders/k8s)
+# discovers cluster members by listing/watching Pods and advertises this pod's own
+# membership by patching its own Pod labels. It needs API access scoped to the
+# wallet namespace only.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wallet
+  namespace: wallet
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wallet-cluster
+  namespace: wallet
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wallet-cluster
+  namespace: wallet
+subjects:
+  - kind: ServiceAccount
+    name: wallet
+    namespace: wallet
+roleRef:
+  kind: Role
+  name: wallet-cluster
+  apiGroup: rbac.authorization.k8s.io
