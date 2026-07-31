@@ -13,7 +13,7 @@ all: build
 .PHONY: build
 build:
 	@echo "Building the jp_gateway application..."
-	@go build -o $(BINARY_NAME) cmd/api/main.go
+	@go build -o $(BINARY_NAME) $(CMD_DIR)/main.go
 
 # Run the application (without building again)
 .PHONY: run
@@ -53,7 +53,27 @@ docker-build:
 .PHONY: docker-run
 docker-run:
 	@echo "Running wallet Docker container..."
-	@docker run -p 3000:3000 $(BINARY_NAME)
+	@docker run -p 3003:3003 -p 3004:3004 $(BINARY_NAME)
+
+# Kubernetes manifests live under internal/k8 and are assembled with kustomize.
+K8S_DIR=internal/k8
+
+# Render the Kubernetes manifests (sanity-check kustomization without applying)
+.PHONY: k8s-render
+k8s-render:
+	@kubectl kustomize $(K8S_DIR)
+
+# Apply the Kubernetes manifests to the current kubectl context
+.PHONY: k8s-apply
+k8s-apply:
+	@echo "Applying wallet Kubernetes manifests..."
+	@kubectl apply -k $(K8S_DIR)
+
+# Remove the Kubernetes manifests from the current kubectl context
+.PHONY: k8s-delete
+k8s-delete:
+	@echo "Deleting wallet Kubernetes manifests..."
+	@kubectl delete -k $(K8S_DIR)
 
 # Generate swagger docs
 swag:

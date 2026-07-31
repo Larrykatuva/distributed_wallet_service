@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: wallet
+
+resources:
+  - 00-namespace.yaml
+  - 01-rbac.yaml
+  - 02-configmap.yaml
+  - 03-secret.yaml
+  - 04-postgres.yaml
+  - 05-deployment.yaml
+  - 06-service.yaml
+  - 07-ingress.yaml
+  - 08-pdb.yaml

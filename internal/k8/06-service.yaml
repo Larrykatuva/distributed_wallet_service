@@ -1,0 +1,21 @@
+# Fronts the HTTP and gRPC APIs for in-cluster callers (and the Ingress below).
+# NOT used for actor-to-actor remoting — that happens pod-to-pod directly over
+# CLUSTER_PORT via the pod IP the k8s cluster provider discovers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wallet
+  namespace: wallet
+  labels:
+    app.kubernetes.io/name: wallet
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: wallet
+  ports:
+    - name: http
+      port: 3003
+      targetPort: http
+    - name: grpc
+      port: 3004
+      targetPort: grpc
