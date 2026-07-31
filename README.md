@@ -302,7 +302,7 @@ CLUSTER_MODE=cluster make run
 
 ### Deploying to Kubernetes
 
-Manifests live under [`internal/k8`](internal/k8) and are assembled with `kustomize`: namespace,
+Manifests live under [`internal/k8`](k8) and are assembled with `kustomize`: namespace,
 RBAC (for the Proto.Actor k8s cluster provider), config/secrets, a self-contained Postgres
 StatefulSet, and the `wallet` Deployment/Service/Ingress/PDB.
 
