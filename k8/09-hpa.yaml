@@ -1,0 +1,49 @@
+# Requires metrics-server. Scales on CPU because the hot path is CPU-bound
+# (JSON, protobuf, actor dispatch); memory is a guard rail.
+#
+# Rough capacity: one pod at 1 vCPU request sustained ~1000 initiations/s
+# on a laptop with everything local, so 10k rps needs ~10-15 pods with
+# headroom. The HPA range below covers that; the database must keep up.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: wallet
+  namespace: wallet
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: wallet
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      # Scaling in moves grains between nodes; do it slowly.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

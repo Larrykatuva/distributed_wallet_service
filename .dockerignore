@@ -64,3 +64,4 @@ docs/
 # Git metadata
 .git
 .github
+.claude

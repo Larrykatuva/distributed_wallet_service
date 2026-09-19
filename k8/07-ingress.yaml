@@ -1,6 +1,3 @@
-# Optional — HTTP API only (gRPC needs an ingress controller configured for
-# HTTP/2 + grpc backend protocol, which varies by controller; omitted here).
-# Adjust ingressClassName/host/TLS for your environment, or delete this file.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -8,6 +5,11 @@ metadata:
   namespace: wallet
   annotations:
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    # Keep upstream connections warm; at 10k rps connection churn matters.
+    nginx.ingress.kubernetes.io/upstream-keepalive-connections: "256"
 spec:
   ingressClassName: nginx
   rules:
@@ -21,3 +23,29 @@ spec:
                 name: wallet
                 port:
                   name: http
+---
+# gRPC through ingress-nginx requires TLS (HTTP/2). Terminate with a real
+# certificate and nginx balances per RPC across pods.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wallet-grpc
+  namespace: wallet
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [grpc.wallet.example.com]
+      secretName: wallet-grpc-tls   # provide via cert-manager or kubectl create secret tls
+  rules:
+    - host: grpc.wallet.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: wallet
+                port:
+                  name: grpc

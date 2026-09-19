@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	_ "gorm.io/gorm"
 )
 
 type ProfileType string

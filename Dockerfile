@@ -16,14 +16,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/wallet 
 # --- Runtime stage -------------------------------------------------------------
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata wget \
     && addgroup -S wallet \
     && adduser -S wallet -G wallet
 
 WORKDIR /app
 COPY --from=builder /out/wallet ./wallet
 
-# The app's logger creates ./logs relative to its working directory at startup
+# The logger writes one file per day under ./logs (LOG_DIR) relative to the working directory
 # (dpk/logger/logger.go) — the non-root user below needs write access to do that.
 RUN mkdir -p /app/logs && chown -R wallet:wallet /app
 

@@ -1,52 +1,60 @@
+// Package logger exposes leveled loggers that always write to stdout (so
+// container runtimes capture them) and, by default, to one file per calendar
+// day as well. The file rolls over automatically at midnight.
 package logger
 
 import (
+	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"strconv"
-	"time"
 )
 
-// Declare global loggers for different log levels
 var (
-	WarningLog *log.Logger
 	InfoLog    *log.Logger
+	WarningLog *log.Logger
 	ErrorLog   *log.Logger
 )
 
-// StartLogger initializes logging configuration.
-// It reads environment variables to determine if logging should go to a file or stdout.
-// Logs are written to a file named with the current date if `LogToFile` is true.
+// init guarantees the loggers are usable even before StartLogger runs
+// (config.Load logs during startup).
+func init() {
+	configure(os.Stdout)
+}
+
+// StartLogger reads LOG_TO_FILE (default true) and LOG_DIR (default ./logs).
+// When file logging is on, each day's output goes to <LOG_DIR>/<YYYY-MM-DD>-app.log.
 func StartLogger() {
+	toFile := true
+	if v := os.Getenv("LOG_TO_FILE"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			toFile = parsed
+		}
+	}
+	if !toFile {
+		configure(os.Stdout)
+		return
+	}
 
-	// Get the current date in a more readable format (YYYY-MM-DD)
-	year, month, day := time.Now().Date()
-	date := strconv.Itoa(year) + "-" + month.String() + "-" + strconv.Itoa(day)
-	fileName := date + "th-appLogs.log"
+	dir := os.Getenv("LOG_DIR")
+	if dir == "" {
+		dir = "./logs"
+	}
 
-	// Ensure the logs directory exists
-	logDir := "./logs"
-	err := os.MkdirAll(logDir, os.ModePerm)
+	fw, err := newDailyWriter(dir, nil)
 	if err != nil {
-		log.Fatal("Error creating log directory: ", err)
+		ErrorLog.Printf("logger: %v; logging to stdout only", err)
+		return
 	}
 
-	// Create the log file in the logs directory
-	logFilePath := filepath.Join(logDir, fileName)
-	logFile, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
-	if err != nil {
-		log.Fatal("Error opening log file: ", err)
-	}
+	configure(io.MultiWriter(os.Stdout, fw))
+	InfoLog.Printf("logger: writing daily log files under %s", dir)
+}
 
-	// Check if LogToFile environment variable is set
-	logToFile, _ := strconv.ParseBool(os.Getenv("LogToFile"))
-	if logToFile {
-		log.SetOutput(logFile)
-	}
-
-	// Initialize loggers with different log levels
-	InfoLog = log.New(logFile, "INFO: ", log.Ldate|log.Ltime|log.Lshortfile)
-	WarningLog = log.New(logFile, "WARNING: ", log.Ldate|log.Ltime|log.Lshortfile)
-	ErrorLog = log.New(logFile, "ERROR: ", log.Ldate|log.Ltime|log.Lshortfile)
+func configure(w io.Writer) {
+	flags := log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile
+	InfoLog = log.New(w, "INFO  ", flags)
+	WarningLog = log.New(w, "WARN  ", flags)
+	ErrorLog = log.New(w, "ERROR ", flags)
+	log.SetOutput(w)
 }

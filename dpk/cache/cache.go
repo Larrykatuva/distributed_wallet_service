@@ -1,87 +1,95 @@
 package cache
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"time"
 
+	"github.com/katuva/wallet/dpk/logger"
 	"github.com/redis/go-redis/v9"
 )
 
-type CacheService[T any] interface {
-	WithExpiry(duration time.Duration) *Cache[T]
-	WithData(data T) *Cache[T]
-	WithKey(key string) *Cache[T]
-	Save() error
-	Clear() error
-	Get() (*T, error)
-}
-
-type Cache[T any] struct {
-	expiry time.Duration
-	data   T
-	key    *string
-	client *redis.Client
-	ctx    context.Context
-}
-
-func NewCacheService[T any]() *Cache[T] {
-	return &Cache[T]{
-		expiry: 1 * time.Minute,
-		client: RedisClient,
-		ctx:    context.Background(),
+// Get loads key into dest. found is false on a miss or when caching is off.
+// Errors are logged and reported as misses so callers never fail on cache.
+func Get(key string, dest any) (found bool) {
+	c := Default
+	if !c.Enabled() {
+		return false
 	}
-}
+	ctx, cancel := c.ctx()
+	defer cancel()
 
-func (c *Cache[T]) WithExpiry(duration time.Duration) *Cache[T] {
-	c.expiry = duration
-	return c
-}
-
-func (c *Cache[T]) WithData(data T) *Cache[T] {
-	c.data = data
-	return c
-}
-
-func (c *Cache[T]) WithKey(key string) *Cache[T] {
-	c.key = &key
-	return c
-}
-
-func (c *Cache[T]) Save() error {
-	if c.key == nil {
-		return errors.New("key to cache value must be set")
-	}
-	dataBytes, err := json.Marshal(c.data)
+	b, err := c.rdb.Get(ctx, key).Bytes()
 	if err != nil {
-		return err
-	}
-	if err := c.client.Set(c.ctx, *c.key, dataBytes, c.expiry).Err(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (c *Cache[T]) Clear() error {
-	return c.client.FlushAll(c.ctx).Err()
-}
-
-func (c *Cache[T]) Get() (*T, error) {
-	if c.key == nil {
-		return nil, errors.New("key to cache value must be set")
-	}
-	dataBytes, err := c.client.Get(c.ctx, *c.key).Bytes()
-	if err != nil {
-		if errors.Is(err, redis.Nil) {
-			return nil, nil
+		if !errors.Is(err, redis.Nil) {
+			logger.WarningLog.Printf("cache: get %s: %v", key, err)
 		}
-		return nil, err
+		return false
 	}
+	if err = json.Unmarshal(b, dest); err != nil {
+		logger.WarningLog.Printf("cache: decode %s: %v", key, err)
+		return false
+	}
+	return true
+}
 
-	var result T
-	if err := json.Unmarshal(dataBytes, &result); err != nil {
-		return nil, err
+// Set stores v under key. ttl <= 0 uses the default TTL.
+func Set(key string, v any, ttl time.Duration) {
+	c := Default
+	if !c.Enabled() {
+		return
 	}
-	return &result, nil
+	if ttl <= 0 {
+		ttl = c.ttl
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		logger.WarningLog.Printf("cache: encode %s: %v", key, err)
+		return
+	}
+	ctx, cancel := c.ctx()
+	defer cancel()
+	if err = c.rdb.Set(ctx, key, b, ttl).Err(); err != nil {
+		logger.WarningLog.Printf("cache: set %s: %v", key, err)
+	}
+}
+
+// Delete removes keys (invalidation after a write). Missing keys are fine.
+func Delete(keys ...string) {
+	c := Default
+	if !c.Enabled() || len(keys) == 0 {
+		return
+	}
+	ctx, cancel := c.ctx()
+	defer cancel()
+	if err := c.rdb.Del(ctx, keys...).Err(); err != nil {
+		logger.WarningLog.Printf("cache: delete %v: %v", keys, err)
+	}
+}
+
+// Exists reports whether key is present. False when caching is off.
+func Exists(key string) bool {
+	c := Default
+	if !c.Enabled() {
+		return false
+	}
+	ctx, cancel := c.ctx()
+	defer cancel()
+	n, err := c.rdb.Exists(ctx, key).Result()
+	return err == nil && n > 0
+}
+
+// Remember returns the cached value for key or loads, stores and returns it.
+// A load error is returned as-is and nothing is cached.
+func Remember[T any](key string, ttl time.Duration, load func() (T, error)) (T, error) {
+	var v T
+	if Get(key, &v) {
+		return v, nil
+	}
+	v, err := load()
+	if err != nil {
+		return v, err
+	}
+	Set(key, v, ttl)
+	return v, nil
 }

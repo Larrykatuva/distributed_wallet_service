@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package actors;
+option go_package = "github.com/katuva/wallet/proto/actors";
+
+// Messages exchanged between TransactionActor and WalletActor.
+//
+// These MUST be protobuf messages: Proto.Actor remoting only serialises
+// proto.Message values, so plain Go structs cannot cross a node boundary.
+// Amounts are int64 minor units (e.g. cents). UUIDs travel as strings.
+
+message TransferEntry {
+  string wallet_id       = 1;
+  string action          = 2; // debit | credit
+  int64  amount          = 3;
+  string purpose         = 4;
+  string idempotency_key = 5;
+  // Set once a reversal has been issued for this leg; persisted so a
+  // recovered transaction resumes the reversal under the same key.
+  string reversal_key    = 6;
+  bool   is_fee          = 7;
+  bool   is_initial      = 8;
+}
+
+// Sent by the service layer once the transaction row is persisted as pending,
+// or by the recovery manager to re-drive a transaction whose orchestrator was
+// lost (resume = true; the actor reconstructs progress from the ledger).
+message StartTransactionMsg {
+  string                 transaction_id  = 1;
+  int64                  created_at_unix = 2; // used for partition pruning
+  repeated TransferEntry transfers       = 3;
+  bool                   resume          = 4;
+}
+
+message CreditWalletMsg {
+  string wallet_id       = 1;
+  int64  amount          = 2;
+  string purpose         = 3;
+  string transaction_id  = 4;
+  string idempotency_key = 5;
+}
+
+message DebitWalletMsg {
+  string wallet_id       = 1;
+  int64  amount          = 2;
+  string purpose         = 3;
+  string transaction_id  = 4;
+  string idempotency_key = 5;
+}
+
+// Reply from a WalletActor. An empty error_code means success.
+message WalletResultMsg {
+  string transaction_id  = 1;
+  string wallet_id       = 2;
+  string idempotency_key = 3;
+  int64  initial_balance = 4;
+  int64  updated_balance = 5;
+  int64  amount          = 6;
+  string error_code      = 7;
+  string error_message   = 8;
+}
+
+// Self-message: all wallet replies (and reversals) collected, write final status.
+message FinalizeTransactionMsg {
+  string transaction_id = 1;
+}
+
+// Self-message: legs still awaiting a reply are treated as failed.
+message TransactionTimeoutMsg {
+  string transaction_id = 1;
+  int32  stage          = 2; // the stage the timer was armed in
+}

@@ -2,232 +2,275 @@ package actors
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/asynkron/protoactor-go/actor"
+	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/google/uuid"
+	"github.com/katuva/wallet/dpk/cache"
+	"github.com/katuva/wallet/dpk/logger"
 	"github.com/katuva/wallet/internal/models"
+	pb "github.com/katuva/wallet/proto/actors"
 	"gorm.io/gorm"
 )
 
-// WalletActor is a proto.actor actor responsible for managing a single wallet's
-// balance operations. One actor instance exists per wallet ID — the actor model
-// guarantees that all operations on the same wallet are serialised through its
-// mailbox, eliminating the need for database-level locks.
+// maxVersionRetries bounds how many times a balance update is retried after
+// an optimistic-concurrency conflict. Conflicts should only come from
+// out-of-band writes because the actor serialises its own wallet.
+const maxVersionRetries = 3
+
+// WalletActor owns a single wallet's balance. One instance exists per wallet
+// ID (cluster grain identity), so all mutations on that wallet are serialised
+// through the mailbox and no database row locks are needed.
 type WalletActor struct {
 	db       *gorm.DB
 	walletID uuid.UUID
+
+	// wallet is this actor's copy of the row. Being the only writer, the
+	// actor can trust it between messages and skip a SELECT per operation;
+	// the version-guarded UPDATE still catches any out-of-band change, on
+	// which the copy is dropped and reloaded.
+	wallet *models.Wallet
 }
 
-// NewWalletActor creates a new WalletActor for the given wallet ID.
-// The db connection is injected so the actor can persist balance changes
-// and ledger entries to PostgreSQL.
-func NewWalletActor(db *gorm.DB, walletID uuid.UUID) actor.Actor {
-	return &WalletActor{
-		db:       db,
-		walletID: walletID,
-	}
+// NewWalletActor is the cluster kind producer. The wallet ID arrives via
+// ClusterInit (grain identity) and is cross-checked against every message.
+func NewWalletActor(db *gorm.DB) actor.Actor {
+	return &WalletActor{db: db}
 }
 
-// Receive is the actor's message handler. Proto.actor guarantees this method
-// is never called concurrently for the same actor — messages are processed
-// one at a time from the mailbox, making all balance mutations thread-safe
-// without explicit locking.
+// NewWalletActorFor builds an actor bound to a known wallet, for local spawns.
+func NewWalletActorFor(db *gorm.DB, walletID uuid.UUID) actor.Actor {
+	return &WalletActor{db: db, walletID: walletID}
+}
+
 func (w *WalletActor) Receive(ctx actor.Context) {
 	switch msg := ctx.Message().(type) {
-
-	// CreditWalletMsg increases the wallet balance.
-	// Sent by TransactionActor for credit transfers and debit reversals.
-	case CreditWalletMsg:
-		resultMsg := WalletResultMsg{
-			WalletID:       w.walletID,
-			TransactionID:  msg.TransactionID,
-			IdempotencyKey: msg.IdempotencyKey,
-			Amount:         msg.Amount,
-		}
-
-		// Validate wallet status — credits do not check balance since
-		// we are adding funds, not subtracting them
-		wallet, err := w.getValidatedWallet(nil)
-		if err != nil {
-			resultMsg.Error = err
+	case *cluster.ClusterInit:
+		if id, err := uuid.Parse(msg.Identity.Identity); err == nil {
+			w.walletID = id
 		} else {
-			resultMsg.InitialBalance = wallet.AvailableBalance
-			resultMsg.UpdatedBalance = wallet.AvailableBalance
-
-			if err = w.handleCredit(wallet, msg); err != nil {
-				resultMsg.Error = err
-			} else {
-				// Reflect the new balance in the result after successful credit
-				resultMsg.InitialBalance = wallet.ActualBalance
-				resultMsg.UpdatedBalance = wallet.ActualBalance + msg.Amount
-			}
+			logger.ErrorLog.Printf("wallet actor: bad grain identity %q: %v", msg.Identity.Identity, err)
 		}
 
-		// Reply to the TransactionActor that sent this message.
-		// ctx.Sender() is set because TransactionActor uses ctx.Request.
-		ctx.Send(ctx.Sender(), resultMsg)
+	case *pb.CreditWalletMsg:
+		w.handle(ctx, models.LedgerTypeCredit, msg.WalletId, msg.TransactionId, msg.IdempotencyKey, msg.Amount, msg.Purpose)
 
-	// DebitWalletMsg decreases the wallet balance.
-	// Sent by TransactionActor for debit transfers and credit reversals.
-	case DebitWalletMsg:
-		resultMsg := WalletResultMsg{
-			WalletID:       w.walletID,
-			TransactionID:  msg.TransactionID,
-			IdempotencyKey: msg.IdempotencyKey,
-			Amount:         msg.Amount,
-		}
-
-		// Validate wallet status and check sufficient funds.
-		// Passing &msg.Amount triggers the balance check in getValidatedWallet.
-		wallet, err := w.getValidatedWallet(&msg.Amount)
-		if err != nil {
-			resultMsg.Error = err
-		} else {
-			resultMsg.InitialBalance = wallet.AvailableBalance
-			resultMsg.UpdatedBalance = wallet.AvailableBalance
-
-			if err = w.handleDebit(wallet, msg); err != nil {
-				resultMsg.Error = err
-			} else {
-				// Reflect the new balance in the result after successful debit
-				resultMsg.InitialBalance = wallet.ActualBalance
-				resultMsg.UpdatedBalance = wallet.ActualBalance - msg.Amount
-			}
-		}
-
-		ctx.Send(ctx.Sender(), resultMsg)
+	case *pb.DebitWalletMsg:
+		w.handle(ctx, models.LedgerTypeDebit, msg.WalletId, msg.TransactionId, msg.IdempotencyKey, msg.Amount, msg.Purpose)
 	}
 }
 
-// getValidatedWallet fetches the wallet from the database and validates it.
-// If amount is non-nil, it also checks that the wallet has sufficient funds.
-// Returns an error if the wallet is not found, inactive, or underfunded.
-func (w *WalletActor) getValidatedWallet(amount *float64) (*models.Wallet, error) {
+type applyResult struct {
+	initial, updated int64
+}
+
+func (w *WalletActor) handle(ctx actor.Context, action models.LedgerType, walletIDStr, txIDStr, keyStr string, amount int64, purpose string) {
+	reply := &pb.WalletResultMsg{
+		WalletId:       walletIDStr,
+		TransactionId:  txIDStr,
+		IdempotencyKey: keyStr,
+		Amount:         amount,
+	}
+
+	res, err := w.apply(action, walletIDStr, txIDStr, keyStr, amount, purpose)
+	if err != nil {
+		we := wrapInternal(err)
+		reply.ErrorCode = string(we.Code)
+		reply.ErrorMessage = we.Message
+		if we.Code == CodeInternal || we.Code == CodeChecksumMismatch {
+			logger.ErrorLog.Printf("wallet %s %s failed: %v", walletIDStr, action, err)
+		}
+	} else {
+		reply.InitialBalance = res.initial
+		reply.UpdatedBalance = res.updated
+	}
+
+	if ctx.Sender() != nil {
+		ctx.Respond(reply)
+	}
+}
+
+func (w *WalletActor) apply(action models.LedgerType, walletIDStr, txIDStr, keyStr string, amount int64, purpose string) (applyResult, error) {
+	walletID, err := uuid.Parse(walletIDStr)
+	if err != nil {
+		return applyResult{}, newWalletError(CodeInvalidMessage, "wallet_id is not a UUID")
+	}
+	txID, err := uuid.Parse(txIDStr)
+	if err != nil {
+		return applyResult{}, newWalletError(CodeInvalidMessage, "transaction_id is not a UUID")
+	}
+	key, err := uuid.Parse(keyStr)
+	if err != nil {
+		return applyResult{}, newWalletError(CodeInvalidMessage, "idempotency_key is not a UUID")
+	}
+	if amount <= 0 {
+		return applyResult{}, newWalletError(CodeInvalidMessage, "amount must be positive")
+	}
+	if w.walletID != uuid.Nil && w.walletID != walletID {
+		return applyResult{}, newWalletError(CodeWalletMismatch,
+			fmt.Sprintf("message for %s delivered to actor for %s", walletID, w.walletID))
+	}
+
+	// Idempotency: a redelivered message must not move the balance twice.
+	// Safe without locking because this actor is the only writer for the wallet.
+	if prior, found, err := w.findLedger(walletID, key); err != nil {
+		return applyResult{}, wrapInternal(err)
+	} else if found {
+		return applyResult{initial: prior.InitialBalance, updated: prior.UpdatedBalance}, nil
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxVersionRetries; attempt++ {
+		wallet, err := w.current(walletID)
+		if err != nil {
+			return applyResult{}, err
+		}
+
+		if action == models.LedgerTypeDebit && wallet.AvailableBalance < amount {
+			return applyResult{}, newWalletError(CodeInsufficientFunds,
+				fmt.Sprintf("available %d < requested %d", wallet.AvailableBalance, amount))
+		}
+
+		res, err := w.persist(wallet, action, txID, key, amount, purpose)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		w.wallet = nil // whatever we held is stale
+		var we *WalletError
+		if !errors.As(err, &we) || we.Code != CodeVersionConflict {
+			return applyResult{}, wrapInternal(err)
+		}
+	}
+	return applyResult{}, wrapInternal(lastErr)
+}
+
+// current returns the in-memory wallet, loading it on first use.
+func (w *WalletActor) current(walletID uuid.UUID) (*models.Wallet, error) {
+	if w.wallet != nil && w.wallet.ID == walletID {
+		if w.wallet.Status != models.WalletStatusActive {
+			return nil, newWalletError(CodeInactiveWallet, string(w.wallet.Status))
+		}
+		return w.wallet, nil
+	}
+	wallet, err := w.load(walletID)
+	if err != nil {
+		return nil, err
+	}
+	w.wallet = wallet
+	return wallet, nil
+}
+
+// load fetches the wallet and enforces status and checksum integrity.
+func (w *WalletActor) load(walletID uuid.UUID) (*models.Wallet, error) {
 	var wallet models.Wallet
-
-	result := w.db.
-		Model(models.Wallet{}).
-		First(&wallet, "id = ?", w.walletID)
-	if result.Error != nil {
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return nil, errors.New(string(WalletNotFoundMsg))
+	err := w.db.First(&wallet, "id = ?", walletID).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, newWalletError(CodeWalletNotFound, walletID.String())
 		}
-		return nil, result.Error
+		return nil, wrapInternal(err)
 	}
 
-	// Only active wallets can process transactions.
-	// Suspended, frozen, and closed wallets are rejected here.
-	if wallet.Status != "active" {
-		return nil, errors.New(string(InactiveWalletMsg))
+	if wallet.Status != models.WalletStatusActive {
+		return nil, newWalletError(CodeInactiveWallet, string(wallet.Status))
 	}
 
-	// For debits only — ensure the wallet has enough available balance
-	// before proceeding. Credits skip this check.
-	if amount != nil {
-		if wallet.AvailableBalance < *amount {
-			return nil, errors.New(string(InsufficientFundsMsg))
-		}
+	// An empty checksum means the row predates checksumming; it is stamped on
+	// the next successful mutation. Any other mismatch is tampering or a bug.
+	if wallet.Checksum != "" && wallet.Checksum != ComputeChecksum(&wallet) {
+		return nil, newWalletError(CodeChecksumMismatch, walletID.String())
 	}
 
 	return &wallet, nil
 }
 
-// handleCredit applies a credit to the wallet inside a database transaction.
-// Both the wallet balance update and the ledger entry are written atomically —
-// if either fails, both are rolled back.
-func (w *WalletActor) handleCredit(wallet *models.Wallet, msg CreditWalletMsg) error {
-	return w.db.Transaction(func(tx *gorm.DB) error {
-		actualBalance := wallet.ActualBalance + msg.Amount
-
-		// Update both available and actual balances, bump the version for
-		// optimistic concurrency tracking, and recompute the checksum for
-		// tamper detection.
-		err := tx.
-			Model(models.Wallet{}).
-			Where("id = ?", w.walletID).
-			Updates(map[string]any{
-				"available_balance": actualBalance,
-				"actual_balance":    actualBalance,
-				"version":           gorm.Expr("version + 1"),
-				"checksum":          computeChecksum(w.walletID, actualBalance, wallet.Version+1),
-				"updated_at":        time.Now(),
-			}).Error
-		if err != nil {
-			return err
-		}
-
-		// Write an immutable ledger record for this credit.
-		// The ledger is the source of truth for all balance movements.
-		err = tx.Create(&models.Ledger{
-			WalletID:       w.walletID,
-			TransactionID:  msg.TransactionID,
-			Type:           models.LedgerTypeCredit,
-			Purpose:        msg.Purpose,
-			Amount:         msg.Amount,
-			Currency:       wallet.Currency,
-			InitialBalance: wallet.ActualBalance,
-			UpdatedBalance: actualBalance,
-		}).Error
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+func (w *WalletActor) findLedger(walletID, key uuid.UUID) (*models.Ledger, bool, error) {
+	var ledger models.Ledger
+	err := w.db.
+		Select("id", "initial_balance", "updated_balance").
+		Where("wallet_id = ? AND idempotency_key = ?", walletID, key).
+		Limit(1).
+		Find(&ledger).Error
+	if err != nil {
+		return nil, false, err
+	}
+	if ledger.ID == 0 {
+		return nil, false, nil
+	}
+	return &ledger, true, nil
 }
 
-// handleDebit applies a debit to the wallet inside a database transaction.
-// Both the wallet balance update and the ledger entry are written atomically —
-// if either fails, both are rolled back.
-func (w *WalletActor) handleDebit(wallet *models.Wallet, msg DebitWalletMsg) error {
-	return w.db.Transaction(func(tx *gorm.DB) error {
-		actualBalance := wallet.ActualBalance - msg.Amount
+// persist applies the balance change and writes the ledger row atomically.
+// The UPDATE is guarded by the version read in load(); zero rows affected
+// means something else changed the wallet and the caller re-reads and retries.
+func (w *WalletActor) persist(wallet *models.Wallet, action models.LedgerType, txID, key uuid.UUID, amount int64, purpose string) (applyResult, error) {
+	delta := amount
+	if action == models.LedgerTypeDebit {
+		delta = -amount
+	}
 
-		// Update both available and actual balances, bump the version for
-		// optimistic concurrency tracking, and recompute the checksum for
-		// tamper detection.
-		err := tx.
-			Model(models.Wallet{}).
-			Where("id = ?", w.walletID).
+	next := *wallet
+	next.AvailableBalance += delta
+	next.ActualBalance += delta
+	next.Version++
+	next.Checksum = ComputeChecksum(&next)
+
+	if next.AvailableBalance < 0 || next.ActualBalance < 0 {
+		return applyResult{}, newWalletError(CodeInsufficientFunds, "balance would go negative")
+	}
+
+	err := w.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&models.Wallet{}).
+			Where("id = ? AND version = ?", wallet.ID, wallet.Version).
 			Updates(map[string]any{
-				"actual_balance":    actualBalance,
-				"available_balance": actualBalance,
-				"version":           gorm.Expr("version + 1"),
-				"checksum":          computeChecksum(w.walletID, actualBalance, wallet.Version+1),
+				"available_balance": next.AvailableBalance,
+				"actual_balance":    next.ActualBalance,
+				"version":           next.Version,
+				"checksum":          next.Checksum,
 				"updated_at":        time.Now(),
-			}).Error
-		if err != nil {
-			return err
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return newWalletError(CodeVersionConflict,
+				fmt.Sprintf("wallet %s version %d is stale", wallet.ID, wallet.Version))
 		}
 
-		// Write an immutable ledger record for this debit.
-		// The ledger is the source of truth for all balance movements.
-		err = tx.Create(&models.Ledger{
-			WalletID:       w.walletID,
-			TransactionID:  msg.TransactionID,
-			Type:           models.LedgerTypeDebit,
-			Purpose:        msg.Purpose,
-			Amount:         msg.Amount,
+		return tx.Create(&models.Ledger{
+			WalletID:       wallet.ID,
+			TransactionID:  txID,
+			IdempotencyKey: &key,
+			Type:           action,
+			Purpose:        purpose,
+			Amount:         amount,
 			Currency:       wallet.Currency,
 			InitialBalance: wallet.ActualBalance,
-			UpdatedBalance: actualBalance,
+			UpdatedBalance: next.ActualBalance,
 		}).Error
-		if err != nil {
-			return err
-		}
-
-		return nil
 	})
+	if err != nil {
+		return applyResult{}, err
+	}
+
+	// Keep the in-memory copy current and drop any cached read of this wallet.
+	next.UpdatedAt = time.Now()
+	w.wallet = &next
+	cache.Delete(cache.WalletKey(wallet.ID.String()), cache.WalletNumberKey(wallet.Number))
+
+	return applyResult{initial: wallet.ActualBalance, updated: next.ActualBalance}, nil
 }
 
-// computeChecksum generates a SHA-256 hash of the wallet's critical fields.
-// Stored in wallet.Checksum after every balance mutation — any out-of-band
-// database modification will cause a checksum mismatch detectable on next read.
-func computeChecksum(walletID uuid.UUID, available float64, version int64) string {
-	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%s:%d:%d:%d", walletID, available, version)))
-	return fmt.Sprintf("%x", h.Sum(nil))
+// ComputeChecksum hashes the fields that define a wallet's financial state.
+// Kept in sync with the SQL backfill in migration 000005.
+func ComputeChecksum(w *models.Wallet) string {
+	payload := fmt.Sprintf("%s:%d:%d:%d:%d",
+		w.ID, w.ActualBalance, w.AvailableBalance, w.ProcessingBalance, w.Version)
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
 }

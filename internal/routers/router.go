@@ -1,32 +1,51 @@
 package routers
 
 import (
-	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/go-chi/chi/v5"
 	"github.com/katuva/wallet/internal/handlers/http"
-	"gorm.io/gorm"
+	"github.com/katuva/wallet/internal/services"
 )
 
-func Router(db *gorm.DB, cluster *cluster.Cluster) *chi.Mux {
-	router := chi.NewRouter()
+// Services groups the service layer shared by every transport.
+type Services struct {
+	Profiles     *services.ProfileService
+	Wallets      *services.WalletService
+	Transactions *services.TransactionService
+}
 
-	transHandler := http.NewTransactionHandler(db, cluster)
+// Router mounts the versioned API.
+func Router(svc Services) *chi.Mux {
+	r := chi.NewRouter()
 
-	profileHandler := http.NewProfileHandler(db)
+	profiles := http.NewProfileHandler(svc.Profiles)
+	wallets := http.NewWalletHandler(svc.Wallets)
+	transactions := http.NewTransactionHandler(svc.Transactions)
 
-	walletHandler := http.NewWalletHandler(db)
+	r.Get("/currencies", http.ListCurrencies)
 
-	router.Route("/transaction/", func(trans chi.Router) {
-		trans.Post("/initiate", transHandler.Initiate)
+	r.Route("/profile", func(pr chi.Router) {
+		pr.Post("/register", profiles.Register)
+		pr.Get("/", profiles.List)
+		pr.Get("/username/{username}", profiles.GetByUsername)
+		pr.Get("/{id}", profiles.Get)
 	})
 
-	router.Route("/profile", func(profile chi.Router) {
-		profile.Post("/register", profileHandler.Register)
+	r.Route("/wallet", func(wr chi.Router) {
+		wr.Post("/create", wallets.Create)
+		wr.Get("/", wallets.List)
+		wr.Get("/number/{number}", wallets.GetByNumber)
+		wr.Get("/profile/{profileId}", wallets.ListByProfile)
+		wr.Get("/{id}", wallets.Get)
 	})
 
-	router.Route("/wallet", func(wallet chi.Router) {
-		wallet.Post("/create", walletHandler.Create)
+	r.Route("/transaction", func(tr chi.Router) {
+		tr.Post("/initiate", transactions.Initiate)
+		tr.Get("/", transactions.List)
+		tr.Get("/rrn/{rrn}", transactions.GetByRRN)
+		tr.Post("/rrn/{rrn}/resend-callback", transactions.ResendCallback)
+		tr.Get("/order/{orderId}", transactions.GetByOrderID)
+		tr.Get("/{id}", transactions.GetByID)
 	})
 
-	return router
+	return r
 }

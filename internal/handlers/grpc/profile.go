@@ -2,69 +2,45 @@ package grpc
 
 import (
 	"context"
-	"encoding/json" // ← add
+	"encoding/json"
 
 	"github.com/katuva/wallet/internal/models"
 	"github.com/katuva/wallet/internal/services"
 	"github.com/katuva/wallet/internal/types"
-	pb "github.com/katuva/wallet/proto/profile" // ← add
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"gorm.io/gorm"
+	"github.com/katuva/wallet/internal/validation"
+	pb "github.com/katuva/wallet/proto/profile"
 )
 
 type ProfileGrpcHandler struct {
 	pb.UnimplementedProfileServiceServer
-	profileService *services.ProfileServiceImpl
+	profiles *services.ProfileService
 }
 
-func NewProfileGrpcHandler(db *gorm.DB) *ProfileGrpcHandler {
-	return &ProfileGrpcHandler{
-		profileService: services.NewProfileService(db),
-	}
+func NewProfileGrpcHandler(profiles *services.ProfileService) *ProfileGrpcHandler {
+	return &ProfileGrpcHandler{profiles: profiles}
 }
 
-func (h *ProfileGrpcHandler) Register(
-	ctx context.Context,
-	req *pb.RegisterRequest,
-) (*pb.RegisterResponse, error) {
-
-	// Validate
-	if req.ExternalId == "" {
-		return nil, status.Error(codes.InvalidArgument, "external_id is required")
-	}
-	if req.Type == "" {
-		return nil, status.Error(codes.InvalidArgument, "type is required")
-	}
-	profileType := models.ProfileType(req.Type)
-	if profileType != models.ProfileTypeIndividual && profileType != models.ProfileTypeBusiness {
-		return nil, status.Error(codes.InvalidArgument, "type must be one of: individual, business")
-	}
-	if req.FullName == "" {
-		return nil, status.Error(codes.InvalidArgument, "full_name is required")
-	}
-	if req.Email == "" {
-		return nil, status.Error(codes.InvalidArgument, "email is required")
-	}
-
-	// Build DTO
+func (h *ProfileGrpcHandler) Register(_ context.Context, req *pb.RegisterRequest) (*pb.RegisterResponse, error) {
 	payload := types.ProfileReqDto{
 		ExternalId: req.ExternalId,
-		Type:       profileType,
+		Type:       models.ProfileType(req.Type),
 		FullName:   req.FullName,
 		Email:      req.Email,
+		Phone:      req.Phone,
 	}
-	if req.Phone != nil {
-		payload.Phone = req.Phone
-	}
-	if req.Metadata != nil {
+	if req.Metadata != nil && *req.Metadata != "" {
+		if !json.Valid([]byte(*req.Metadata)) {
+			return nil, toStatus(validation.FieldErrors{"metadata": "is not valid JSON"})
+		}
 		payload.Metadata = json.RawMessage(*req.Metadata)
 	}
+	if err := validation.Struct(&payload); err != nil {
+		return nil, toStatus(err)
+	}
 
-	// Call service
-	profile, err := h.profileService.Register(payload)
+	profile, err := h.profiles.Register(payload)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, toStatus(err)
 	}
 
 	return &pb.RegisterResponse{

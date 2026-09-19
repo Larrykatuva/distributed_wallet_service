@@ -2,129 +2,144 @@ package grpc
 
 import (
 	"context"
+	"fmt"
+	"time"
 
-	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/google/uuid"
 	"github.com/katuva/wallet/internal/models"
 	"github.com/katuva/wallet/internal/services"
 	"github.com/katuva/wallet/internal/types"
+	"github.com/katuva/wallet/internal/validation"
 	pb "github.com/katuva/wallet/proto/transaction"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"gorm.io/gorm"
 )
 
 type TransactionGrpcHandler struct {
 	pb.UnimplementedTransactionServiceServer
-	transactionService *services.TransactionServiceImpl
+	transactions *services.TransactionService
 }
 
-func NewTransactionGrpcHandler(db *gorm.DB, cluster *cluster.Cluster) *TransactionGrpcHandler {
-	return &TransactionGrpcHandler{
-		transactionService: services.NewTransactionService(db, cluster),
-	}
+func NewTransactionGrpcHandler(transactions *services.TransactionService) *TransactionGrpcHandler {
+	return &TransactionGrpcHandler{transactions: transactions}
 }
 
-func (h *TransactionGrpcHandler) Initiate(
-	ctx context.Context,
-	req *pb.InitiateTransactionRequest,
-) (*pb.InitiateTransactionResponse, error) {
-
-	// Validate
-	if req.Type == "" {
-		return nil, status.Error(codes.InvalidArgument, "type is required")
+func (h *TransactionGrpcHandler) Initiate(_ context.Context, req *pb.InitiateTransactionRequest) (*pb.TransactionResponse, error) {
+	fe := validation.FieldErrors{}
+	merchantID, err := uuid.Parse(req.MerchantId)
+	if err != nil {
+		fe["merchant_id"] = "is not a valid UUID"
 	}
-	txType := models.TransactionType(req.Type)
-	validTypes := map[models.TransactionType]bool{
-		models.TransactionTypeTransfer:   true,
-		models.TransactionTypeDeposit:    true,
-		models.TransactionTypeWithdrawal: true,
-		models.TransactionTypePayment:    true,
-		models.TransactionTypeReversal:   true,
-		models.TransactionTypeAdjustment: true,
+	total, err := types.ParseMoney(req.TotalAmount)
+	if err != nil {
+		fe["total_amount"] = err.Error()
 	}
-	if !validTypes[txType] {
-		return nil, status.Error(codes.InvalidArgument, "type must be one of: transfer, deposit, withdrawal, payment, reversal, adjustment")
+	fee := types.MoneyFromMinor(0, 0)
+	if req.Fee != "" {
+		if fee, err = types.ParseMoney(req.Fee); err != nil {
+			fe["fee"] = err.Error()
+		}
 	}
-	if req.OrderId == "" {
-		return nil, status.Error(codes.InvalidArgument, "order_id is required")
-	}
-	if req.ProviderRef == "" {
-		return nil, status.Error(codes.InvalidArgument, "provider_ref is required")
-	}
-	if req.CallbackUrl == "" {
-		return nil, status.Error(codes.InvalidArgument, "callback_url is required")
-	}
-	if req.TotalAmount <= 0 {
-		return nil, status.Error(codes.InvalidArgument, "total_amount must be greater than 0")
-	}
-	if req.Currency == "" {
-		return nil, status.Error(codes.InvalidArgument, "currency is required")
-	}
-	if len(req.Transfers) == 0 {
-		return nil, status.Error(codes.InvalidArgument, "transfers must have at least 1 entry")
-	}
-
-	// Map transfers
 	transfers := make([]types.TransactionEntryDto, 0, len(req.Transfers))
 	for i, t := range req.Transfers {
-		if t.WalletId == "" {
-			return nil, status.Errorf(codes.InvalidArgument, "transfers[%d]: wallet_id is required", i)
-		}
 		walletID, err := uuid.Parse(t.WalletId)
 		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "transfers[%d]: wallet_id is not a valid UUID", i)
+			fe[fmt.Sprintf("transfers[%d].wallet_id", i)] = "is not a valid UUID"
 		}
-		if t.Action == "" {
-			return nil, status.Errorf(codes.InvalidArgument, "transfers[%d]: action is required", i)
+		amount, err := types.ParseMoney(t.Amount)
+		if err != nil {
+			fe[fmt.Sprintf("transfers[%d].amount", i)] = err.Error()
 		}
-		action := models.LedgerType(t.Action)
-		if action != models.LedgerTypeDebit && action != models.LedgerTypeCredit {
-			return nil, status.Errorf(codes.InvalidArgument, "transfers[%d]: action must be one of: debit, credit", i)
-		}
-		if t.Amount <= 0 {
-			return nil, status.Errorf(codes.InvalidArgument, "transfers[%d]: amount must be greater than 0", i)
-		}
-		if t.Purpose == "" {
-			return nil, status.Errorf(codes.InvalidArgument, "transfers[%d]: purpose is required", i)
-		}
-
 		transfers = append(transfers, types.TransactionEntryDto{
 			WalletID:  walletID,
-			Action:    action,
-			Amount:    t.Amount,
+			Action:    models.LedgerType(t.Action),
+			Amount:    amount,
 			Purpose:   t.Purpose,
 			IsFee:     t.IsFee,
 			IsInitial: t.IsInitial,
 		})
 	}
+	if len(fe) > 0 {
+		return nil, toStatus(fe)
+	}
 
-	// Build DTO
 	payload := types.TransactionReqDto{
-		Type:        txType,
+		Type:        models.TransactionType(req.Type),
+		MerchantID:  merchantID,
 		OrderId:     req.OrderId,
 		ProviderRef: req.ProviderRef,
 		CallbackUrl: req.CallbackUrl,
-		TotalAmount: req.TotalAmount,
-		Fee:         req.Fee,
+		TotalAmount: total,
+		Fee:         fee,
 		Currency:    req.Currency,
 		Purpose:     req.Purpose,
 		Description: req.Description,
 		Transfers:   transfers,
 	}
-
-	// Call service
-	result, err := h.transactionService.Initiate(payload)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+	if err := validation.Struct(&payload); err != nil {
+		return nil, toStatus(err)
 	}
 
-	return &pb.InitiateTransactionResponse{
-		OrderId:     result.OrderID,
-		ProviderRef: result.ProviderRef,
-		Rrn:         result.Rrn,
-		Type:        string(result.Type),
-		Status:      string(result.Status),
-		Narration:   result.Narration,
-	}, nil
+	result, err := h.transactions.Initiate(payload)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return transactionToProto(result), nil
+}
+
+func (h *TransactionGrpcHandler) Get(_ context.Context, req *pb.GetTransactionRequest) (*pb.TransactionResponse, error) {
+	var (
+		result types.TransactionResDto
+		err    error
+	)
+	switch {
+	case req.Rrn != nil && *req.Rrn != "":
+		result, err = h.transactions.GetByRRN(*req.Rrn)
+	case req.OrderId != nil && *req.OrderId != "":
+		result, err = h.transactions.GetByOrderID(*req.OrderId)
+	default:
+		return nil, toStatus(validation.FieldErrors{"rrn": "or order_id is required"})
+	}
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return transactionToProto(result), nil
+}
+
+func transactionToProto(t types.TransactionResDto) *pb.TransactionResponse {
+	out := &pb.TransactionResponse{
+		Id:          t.ID.String(),
+		OrderId:     t.OrderID,
+		ProviderRef: t.ProviderRef,
+		Rrn:         t.Rrn,
+		CallbackUrl: t.CallbackURL,
+		Type:        string(t.Type),
+		Status:      string(t.Status),
+		Narration:   t.Narration,
+		Amount:      t.Amount.String(),
+		Fee:         t.Fee.String(),
+		Currency:    t.Currency,
+		IsCompleted: t.IsCompleted,
+		CreatedAt:   t.CreatedAt.Format(time.RFC3339),
+	}
+	if t.MerchantID != nil {
+		m := t.MerchantID.String()
+		out.MerchantId = &m
+	}
+	for _, b := range t.Balances {
+		out.Balances = append(out.Balances, &pb.WalletBalanceDto{
+			WalletId: b.WalletID.String(), Currency: b.Currency,
+			InitialBalance: b.InitialBalance.String(), UpdatedBalance: b.UpdatedBalance.String(),
+			Entries: int32(b.Entries),
+		})
+	}
+	for _, l := range t.Transfers {
+		out.Transfers = append(out.Transfers, &pb.TransactionEntryDto{
+			WalletId: l.WalletID.String(), Action: string(l.Action), Amount: l.Amount.String(),
+			Purpose: l.Purpose, IsFee: l.IsFee, IsInitial: l.IsInitial,
+		})
+	}
+	if t.DateCompleted != nil {
+		s := t.DateCompleted.Format(time.RFC3339)
+		out.DateCompleted = &s
+	}
+	return out
 }

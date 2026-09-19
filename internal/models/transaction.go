@@ -1,10 +1,10 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
-	_ "gorm.io/gorm"
 )
 
 type TransactionType string
@@ -26,10 +26,14 @@ const (
 	TransactionStatusFailed     TransactionStatus = "failed"
 )
 
+// Transaction records a financial event. Amounts are int64 minor units.
+// The table is range-partitioned by created_at, so every lookup should
+// include a created_at bound to allow partition pruning.
 type Transaction struct {
 	ID uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 
 	// Parties
+	MerchantID   *uuid.UUID `gorm:"type:uuid;not null;index"` // merchant initiating the transaction
 	MerchantFrom *uuid.UUID `gorm:"type:uuid;index"`
 	MerchantTo   *uuid.UUID `gorm:"type:uuid;index"`
 	ProfileFrom  *uuid.UUID `gorm:"type:uuid;index"`
@@ -48,9 +52,9 @@ type Transaction struct {
 	WalletTo   *uuid.UUID `gorm:"type:uuid;index"`
 
 	// Financials
-	Amount   float64 `gorm:"not null;check:amount > 0"`
-	Currency string  `gorm:"type:text;not null;default:KES"`
-	Fee      float64 `gorm:"not null;default:0;check:fee >= 0"`
+	Amount   int64  `gorm:"not null;check:amount > 0"`
+	Currency string `gorm:"type:text;not null;default:KES"`
+	Fee      int64  `gorm:"not null;default:0;check:fee >= 0"`
 
 	// Classification
 	Type    TransactionType   `gorm:"type:transaction_type;not null"`
@@ -61,6 +65,11 @@ type Transaction struct {
 	RRN         string  `gorm:"type:text;not null"`
 	OrderID     *string `gorm:"type:text;index"`
 	ProviderRef *string `gorm:"type:text;index"`
+	CallbackURL *string `gorm:"type:text"`
+
+	// Transfer plan (see actors.PlanEntry): legs with their idempotency keys,
+	// used to recover a transaction whose orchestrator was lost.
+	Transfers json.RawMessage `gorm:"type:jsonb;not null;default:'[]'"`
 
 	// Description
 	Narration   string  `gorm:"type:text"`
@@ -72,14 +81,6 @@ type Transaction struct {
 
 	CreatedAt time.Time `gorm:"not null"`
 	UpdatedAt time.Time `gorm:"not null"`
-
-	// Associations
-	MerchantFromProfile *Profile `gorm:"foreignKey:MerchantFrom"`
-	MerchantToProfile   *Profile `gorm:"foreignKey:MerchantTo"`
-	ProfileFromProfile  *Profile `gorm:"foreignKey:ProfileFrom"`
-	ProfileToProfile    *Profile `gorm:"foreignKey:ProfileTo"`
-	WalletFromWallet    *Wallet  `gorm:"foreignKey:WalletFrom"`
-	WalletToWallet      *Wallet  `gorm:"foreignKey:WalletTo"`
 }
 
 func (Transaction) TableName() string {

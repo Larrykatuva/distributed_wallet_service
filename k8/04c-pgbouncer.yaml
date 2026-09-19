@@ -1,0 +1,125 @@
+# Connection pooler between the wallet pods and Postgres.
+#
+# Sizing: each wallet pod opens up to 25 client connections; with the HPA
+# allowing 30 pods that is 750 clients, multiplexed onto 2 x 100 = 200 server
+# connections (transaction mode). Postgres max_connections is 300.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wallet-pgbouncer
+  namespace: wallet
+  labels:
+    app.kubernetes.io/name: wallet-pgbouncer
+spec:
+  selector:
+    app.kubernetes.io/name: wallet-pgbouncer
+  ports:
+    - name: pgbouncer
+      port: 6432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wallet-pgbouncer
+  namespace: wallet
+  labels:
+    app.kubernetes.io/name: wallet-pgbouncer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wallet-pgbouncer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wallet-pgbouncer
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: wallet-pgbouncer
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: pgbouncer
+          image: edoburu/pgbouncer:v1.24.1-p1
+          ports:
+            - name: pgbouncer
+              containerPort: 5432
+          env:
+            - name: DB_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: DB_HOST
+            - name: DB_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: DB_PORT
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: DB_NAME
+            - name: DB_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: wallet-secrets
+                  key: DB_PASSWORD
+            - name: AUTH_TYPE
+              value: scram-sha-256
+            - name: POOL_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: wallet-config
+                  key: PGBOUNCER_POOL_MODE
+            - name: MAX_CLIENT_CONN
+              value: "5000"
+            - name: DEFAULT_POOL_SIZE
+              value: "100"
+            - name: MIN_POOL_SIZE
+              value: "20"
+            - name: RESERVE_POOL_SIZE
+              value: "20"
+            - name: MAX_PREPARED_STATEMENTS   # PgBouncer >= 1.21: prepared statements survive transaction pooling
+              value: "500"
+            - name: SERVER_IDLE_TIMEOUT
+              value: "300"
+            - name: QUERY_WAIT_TIMEOUT
+              value: "30"
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -p 5432 -U $DB_USER"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -p 5432 -U $DB_USER"]
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 500m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 256Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: wallet-pgbouncer
+  namespace: wallet
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wallet-pgbouncer

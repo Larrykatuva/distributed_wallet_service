@@ -1,6 +1,11 @@
+// Package cluster wires the Proto.Actor cluster: single-node automanaged for
+// local runs, Kubernetes provider for multi-pod deployments.
 package cluster
 
 import (
+	"fmt"
+	"time"
+
 	"github.com/asynkron/protoactor-go/actor"
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/asynkron/protoactor-go/cluster/clusterproviders/automanaged"
@@ -11,73 +16,46 @@ import (
 	"github.com/katuva/wallet/dpk/logger"
 )
 
-var instance *cluster.Cluster
+const requestTimeout = 10 * time.Second
 
-type ClusterClient interface {
-	Shutdown(graceful bool)
-	StartMember()
-}
-
-func Init(cfg *config.Config) {
-	if instance != nil {
-		logger.InfoLog.Println("Cluster already initialized")
-		return
-	}
-
+// New builds and starts a cluster member with the given kinds registered.
+func New(cfg *config.Config, kinds []*cluster.Kind) (*cluster.Cluster, error) {
 	system := actor.NewActorSystem()
 
-	remoteConfig := remote.Configure(
-		cfg.AdvertisedHost,
-		cfg.ClusterPort,
-	)
+	remoteConfig := remote.Configure(cfg.AdvertisedHost, cfg.ClusterPort)
 
-	lookup := disthash.New()
+	provider, err := newProvider(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	clusterConfig := cluster.Configure(
 		cfg.ClusterName,
-		newProvider(cfg),
-		lookup,
+		provider,
+		disthash.New(),
 		remoteConfig,
+		cluster.WithKinds(kinds...),
+		cluster.WithRequestTimeout(requestTimeout),
 	)
 
-	instance = cluster.New(system, clusterConfig)
-	logger.InfoLog.Println("Cluster initialized")
+	c := cluster.New(system, clusterConfig)
+	c.StartMember()
+	logger.InfoLog.Printf("cluster %s member started (%s mode) on %s:%d",
+		cfg.ClusterName, cfg.ClusterMode, cfg.AdvertisedHost, cfg.ClusterPort)
+	return c, nil
 }
 
-func Get() *cluster.Cluster {
-	if instance == nil {
-		panic("cluster not initialized — call Init first")
-	}
-	return instance
-}
-
-func Start() {
-	Get().StartMember()
-	logger.InfoLog.Println("Cluster member started")
-}
-
-func Shutdown() {
-	if instance == nil {
-		logger.InfoLog.Println("Cluster not running, nothing to shutdown")
-		return
-	}
-	instance.Shutdown(true)
-	instance = nil
-	logger.InfoLog.Println("Cluster shutdown complete")
-}
-
-func newProvider(cfg *config.Config) cluster.ClusterProvider {
+func newProvider(cfg *config.Config) (cluster.ClusterProvider, error) {
 	switch cfg.ClusterMode {
 	case "cluster":
-		logger.InfoLog.Println("Starting in distributed cluster mode (k8s)")
-		provider, err := k8s.New()
-		if err != nil {
-			logger.ErrorLog.Fatalf("Failed to create k8s provider: %v", err)
-		}
-		return provider
-
+		// Discovers peers through pod labels (cluster.proto.actor/*) in the
+		// pod's own namespace and dials them on ADVERTISED_HOST:CLUSTER_PORT.
+		logger.InfoLog.Printf("cluster: kubernetes provider, namespace %s (from service account)", cfg.K8sNamespace)
+		return k8s.New()
 	default:
-		logger.InfoLog.Println("Starting in single node mode (automanaged)")
-		return automanaged.New()
+		// Each local instance needs its own discovery port, or two processes
+		// on one machine silently form a single cluster.
+		return automanaged.NewWithConfig(2*time.Second, cfg.AutomanagedPort,
+			fmt.Sprintf("localhost:%d", cfg.AutomanagedPort)), nil
 	}
 }

@@ -1,10 +1,12 @@
+# Never let voluntary disruptions (node drains, upgrades) take more than one
+# wallet pod at a time: each is an actor cluster member holding live grains.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: wallet
   namespace: wallet
 spec:
-  minAvailable: 2
+  maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: wallet
