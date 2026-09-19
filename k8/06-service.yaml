@@ -1,6 +1,5 @@
-# Fronts the HTTP and gRPC APIs for in-cluster callers (and the Ingress below).
-# NOT used for actor-to-actor remoting — that happens pod-to-pod directly over
-# CLUSTER_PORT via the pod IP the k8s cluster provider discovers.
+# HTTP behind a normal ClusterIP (kube-proxy balances per connection, and
+# HTTP clients open plenty).
 apiVersion: v1
 kind: Service
 metadata:
@@ -16,6 +15,26 @@ spec:
     - name: http
       port: 3003
       targetPort: http
+    - name: grpc
+      port: 3004
+      targetPort: grpc
+---
+# gRPC multiplexes many calls over one long-lived connection, so a ClusterIP
+# would pin each client to a single pod. Clients that support it should dial
+# this headless Service (dns:///wallet-grpc.wallet.svc.cluster.local:3004
+# with round_robin) or go through an L7 ingress/mesh that balances per RPC.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wallet-grpc
+  namespace: wallet
+  labels:
+    app.kubernetes.io/name: wallet
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: wallet
+  ports:
     - name: grpc
       port: 3004
       targetPort: grpc

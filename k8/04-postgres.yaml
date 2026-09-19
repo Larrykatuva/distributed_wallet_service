@@ -1,6 +1,9 @@
-# Self-contained PostgreSQL for local/dev clusters. For production, point
-# DB_HOST (02-configmap.yaml) at a managed/HA Postgres instance instead and
-# remove this file.
+# Self-contained Postgres for dev/staging clusters.
+#
+# For production at 10k requests/second use a managed, HA Postgres (or an
+# operator such as CloudNativePG) sized around 16+ vCPU with NVMe storage,
+# and point DB_HOST at it. The application tier scales horizontally; the
+# database is the ceiling, and every transaction leg is at least two writes.
 apiVersion: v1
 kind: Service
 metadata:
@@ -36,6 +39,30 @@ spec:
       containers:
         - name: postgres
           image: postgres:16
+          # Sized for the PgBouncer pools below (2 x 100 server connections)
+          # plus migrations and admin sessions.
+          args:
+            - postgres
+            - -c
+            - max_connections=300
+            - -c
+            - shared_buffers=1GB
+            - -c
+            - effective_cache_size=3GB
+            - -c
+            - work_mem=16MB
+            - -c
+            - maintenance_work_mem=256MB
+            - -c
+            - wal_buffers=64MB
+            - -c
+            - max_wal_size=4GB
+            - -c
+            - checkpoint_completion_target=0.9
+            - -c
+            - random_page_cost=1.1
+            - -c
+            - effective_io_concurrency=200
           ports:
             - name: postgres
               containerPort: 5432
@@ -74,11 +101,11 @@ spec:
             periodSeconds: 20
           resources:
             requests:
-              cpu: 250m
-              memory: 256Mi
+              cpu: "2"
+              memory: 4Gi
             limits:
-              cpu: "1"
-              memory: 1Gi
+              cpu: "4"
+              memory: 4Gi
       volumes:
         - name: init-scripts
           configMap:
@@ -90,4 +117,4 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 5Gi
+            storage: 50Gi

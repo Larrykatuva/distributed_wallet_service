@@ -7,80 +7,71 @@ import (
 	"github.com/google/uuid"
 	"github.com/katuva/wallet/internal/services"
 	"github.com/katuva/wallet/internal/types"
+	"github.com/katuva/wallet/internal/validation"
 	pb "github.com/katuva/wallet/proto/wallet"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"gorm.io/gorm"
 )
 
 type WalletGrpcHandler struct {
 	pb.UnimplementedWalletServiceServer
-	walletService *services.WalletServiceImpl
+	wallets *services.WalletService
 }
 
-func NewWalletGrpcHandler(db *gorm.DB) *WalletGrpcHandler {
-	return &WalletGrpcHandler{
-		walletService: services.NewWalletService(db),
-	}
+func NewWalletGrpcHandler(wallets *services.WalletService) *WalletGrpcHandler {
+	return &WalletGrpcHandler{wallets: wallets}
 }
 
-func (h *WalletGrpcHandler) Create(
-	ctx context.Context,
-	req *pb.CreateWalletRequest,
-) (*pb.CreateWalletResponse, error) {
-
-	// Validate
-	if req.ProfileId == "" {
-		return nil, status.Error(codes.InvalidArgument, "profile_id is required")
-	}
-	if req.MerchantId == "" {
-		return nil, status.Error(codes.InvalidArgument, "merchant_id is required")
-	}
-	if req.Currency == "" {
-		return nil, status.Error(codes.InvalidArgument, "currency is required")
-	}
-
-	// Parse UUIDs
+func (h *WalletGrpcHandler) Create(_ context.Context, req *pb.CreateWalletRequest) (*pb.WalletResponse, error) {
+	fe := validation.FieldErrors{}
 	profileID, err := uuid.Parse(req.ProfileId)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "profile_id is not a valid UUID")
+		fe["profile_id"] = "is not a valid UUID"
 	}
 	merchantID, err := uuid.Parse(req.MerchantId)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "merchant_id is not a valid UUID")
+		fe["merchant_id"] = "is not a valid UUID"
+	}
+	if len(fe) > 0 {
+		return nil, toStatus(fe)
 	}
 
-	// Build DTO
-	payload := types.WalletReqDto{
-		ProfileID:  profileID,
-		MerchantID: merchantID,
-		Currency:   req.Currency,
+	payload := types.WalletReqDto{ProfileID: profileID, MerchantID: merchantID, Currency: req.Currency}
+	if err := validation.Struct(&payload); err != nil {
+		return nil, toStatus(err)
 	}
 
-	// Call service
-	wallet, err := h.walletService.Create(payload)
+	wallet, err := h.wallets.Create(payload)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, toStatus(err)
+	}
+	return walletToProto(wallet), nil
+}
+
+func (h *WalletGrpcHandler) Get(_ context.Context, req *pb.GetWalletRequest) (*pb.WalletResponse, error) {
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, toStatus(validation.FieldErrors{"id": "is not a valid UUID"})
 	}
 
-	return &pb.CreateWalletResponse{
-		Id:                wallet.ID.String(),
-		CreatedAt:         wallet.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:         wallet.UpdatedAt.Format(time.RFC3339),
-		Number:            wallet.Number,
-		Status:            string(wallet.Status),
-		Currency:          wallet.Currency,
-		AvailableBalance:  wallet.AvailableBalance,
-		ProcessingBalance: wallet.ProcessingBalance,
-		ActualBalance:     wallet.ActualBalance,
-		Version:           wallet.Version,
-		Profile: &pb.ProfileDto{
-			Id:       wallet.Profile.ID.String(),
-			FullName: wallet.Profile.FullName,
-		},
-		Merchant: &pb.ProfileDto{
-			Id:       wallet.Merchant.ID.String(),
-			FullName: wallet.Merchant.FullName,
-		},
-	}, nil
+	wallet, err := h.wallets.Get(id)
+	if err != nil {
+		return nil, toStatus(err)
+	}
+	return walletToProto(wallet), nil
+}
+
+func walletToProto(w types.WalletResDto) *pb.WalletResponse {
+	return &pb.WalletResponse{
+		Id:                w.ID.String(),
+		CreatedAt:         w.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:         w.UpdatedAt.Format(time.RFC3339),
+		Number:            w.Number,
+		Status:            string(w.Status),
+		Currency:          w.Currency,
+		AvailableBalance:  w.AvailableBalance.String(),
+		ProcessingBalance: w.ProcessingBalance.String(),
+		ActualBalance:     w.ActualBalance.String(),
+		Version:           w.Version,
+		Profile:           &pb.ProfileDto{Id: w.Profile.ID.String(), FullName: w.Profile.FullName},
+		Merchant:          &pb.ProfileDto{Id: w.Merchant.ID.String(), FullName: w.Merchant.FullName},
+	}
 }

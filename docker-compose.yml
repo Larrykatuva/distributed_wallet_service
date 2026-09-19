@@ -1,0 +1,139 @@
+# Distributed Wallet Service: local/single-host deployment.
+#
+#   docker compose up -d --build            # postgres + redis + wallet
+#   docker compose --profile pooler up -d   # ...plus PgBouncer (set USE_PGBOUNCER=true)
+#   docker compose logs -f wallet
+#   docker compose down                     # add -v to drop the database volume
+#
+# Every value can be overridden from a .env file next to this compose file or
+# from the shell. Defaults below are for development only.
+
+name: wallet
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-wallet_database}
+      POSTGRES_USER: ${DB_USER:-wallet}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-wallet}
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "${HOST_POSTGRES_PORT:-5433}:5432"   # host port; the app talks to the service name
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${HOST_REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # Optional connection pooler. Enable with `--profile pooler` and USE_PGBOUNCER=true.
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    profiles: ["pooler"]
+    restart: unless-stopped
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-wallet_database}
+      DB_USER: ${DB_USER:-wallet}
+      DB_PASSWORD: ${DB_PASSWORD:-wallet}
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      MAX_CLIENT_CONN: "1000"
+      DEFAULT_POOL_SIZE: "25"
+      MAX_PREPARED_STATEMENTS: "200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${DB_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  wallet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${WALLET_IMAGE:-wallet:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Only waited for when the pooler profile is active.
+      pgbouncer:
+        condition: service_healthy
+        required: false
+    environment:
+      PORT: "3003"
+      GRPC_PORT: "3004"
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:*}
+      LOG_TO_FILE: ${LOG_TO_FILE:-false}      # stdout is captured by Docker; set true to also write /app/logs
+      LOG_DIR: /app/logs
+
+      CLUSTER_MODE: single
+      CLUSTER_NAME: wallet-cluster
+      CLUSTER_PORT: "8090"
+      ADVERTISED_HOST: 127.0.0.1               # single node: actor remoting stays inside the container
+      AUTOMANAGED_PORT: "6330"
+
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-wallet_database}
+      DB_USER: ${DB_USER:-wallet}
+      DB_PASSWORD: ${DB_PASSWORD:-wallet}
+      DB_SSLMODE: disable
+
+      USE_PGBOUNCER: ${USE_PGBOUNCER:-false}
+      PGBOUNCER_HOST: pgbouncer
+      PGBOUNCER_PORT: "5432"                   # edoburu image listens on 5432 inside the network
+      PGBOUNCER_POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      CACHE_TTL: ${CACHE_TTL:-5m}
+
+      TRANSACTION_TIMEOUT: ${TRANSACTION_TIMEOUT:-30s}
+      RECOVERY_STALE_AFTER: ${RECOVERY_STALE_AFTER:-2m}
+      RECOVERY_SWEEP_INTERVAL: ${RECOVERY_SWEEP_INTERVAL:-30s}
+      RECOVERY_MAX_ATTEMPTS: ${RECOVERY_MAX_ATTEMPTS:-5}
+      SHUTDOWN_TIMEOUT: 20s
+    ports:
+      - "${HOST_HTTP_PORT:-3003}:3003"
+      - "${HOST_GRPC_PORT:-3004}:3004"
+    volumes:
+      - wallet-logs:/app/logs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3003/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    stop_grace_period: 30s
+
+volumes:
+  postgres-data:
+  wallet-logs:

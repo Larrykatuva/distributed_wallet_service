@@ -2,42 +2,73 @@ package servers
 
 import (
 	"net/http"
+	"time"
 
-	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/katuva/wallet/config"
 	"github.com/katuva/wallet/dpk/logger"
-	"github.com/katuva/wallet/internal/actors"
 	"github.com/katuva/wallet/internal/routers"
 	"gorm.io/gorm"
 )
 
-func StartHttpServer(cfg *config.Config, db *gorm.DB, cluster *cluster.Cluster) {
-	mainRouter := chi.NewRouter()
+// startHTTP serves in the background and reports a fatal serve error on the
+// returned channel.
+func startHTTP(cfg *config.Config, gdb *gorm.DB, svc routers.Services) (*http.Server, <-chan error) {
+	r := chi.NewRouter()
 
-	mainRouter.Use(middleware.AllowContentType(
-		"application/json",
-	))
-
-	mainRouter.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://*", "http://*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
-		ExposedHeaders:   []string{"Link"},
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	r.Use(middleware.Timeout(30 * time.Second))
+	r.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   cfg.CorsAllowedOrigins,
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-Request-ID"},
+		ExposedHeaders:   []string{"X-Request-ID"},
 		AllowCredentials: false,
 		MaxAge:           300,
 	}))
 
-	mainRouter.Mount("/v1/", routers.Router(db, cluster))
+	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	r.Get("/readyz", func(w http.ResponseWriter, req *http.Request) {
+		sqlDB, err := gdb.DB()
+		if err == nil {
+			err = sqlDB.PingContext(req.Context())
+		}
+		if err != nil {
+			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+	})
 
-	// Register Dead latter handler
-	actors.NewDeadLatterActor(db, cluster).RegisterHandler()
+	r.Group(func(api chi.Router) {
+		api.Use(middleware.AllowContentType("application/json"))
+		api.Mount("/v1", routers.Router(svc))
+	})
 
-	logger.InfoLog.Println("Server is up")
-	if err := http.ListenAndServe(":"+cfg.Port, mainRouter); err != nil {
-		logger.ErrorLog.Println(err)
+	server := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
-	logger.InfoLog.Println("Server listening to port: " + cfg.Port)
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.InfoLog.Println("HTTP server listening on :" + cfg.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
+	return server, errCh
 }

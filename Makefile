@@ -1,82 +1,79 @@
-# Go binary name
 BINARY_NAME=wallet
+CMD_DIR=./cmd
+K8S_DIR=k8
+PROTO_DIR=proto
+GOBIN?=$(shell go env GOPATH)/bin
+export PATH:=$(GOBIN):$(PATH)
 
-# Go-related directories
-CMD_DIR=cmd
-GO_FILES=$(shell find . -name '*.go')
+.PHONY: all build run test vet lint tidy clean docker-build docker-run \
+        compose-up compose-down compose-logs compose-ps \
+        k8s-render k8s-apply k8s-delete proto migrate-up migrate-down
 
-# Default target: `make` will run this by default
-.PHONY: all
 all: build
 
-# Build the application binary
-.PHONY: build
 build:
-	@echo "Building the jp_gateway application..."
-	@go build -o $(BINARY_NAME) $(CMD_DIR)/main.go
+	@echo "Building $(BINARY_NAME)..."
+	@go build -o $(BINARY_NAME) $(CMD_DIR)
 
-# Run the application (without building again)
-.PHONY: run
 run:
-	@echo "Running the wallet application..."
-	@go run $(CMD_DIR)/main.go
+	@go run $(CMD_DIR)
 
-# Run tests (using Go's testing framework)
-.PHONY: test
 test:
-	@echo "Running wallet tests..."
 	@go test ./...
 
-# Clean the Go build artifacts
-.PHONY: clean
-clean:
-	@echo "Cleaning wallet up..."
-	@rm -f $(BINARY_NAME)
+vet:
+	@go vet ./...
 
-# Install dependencies (equivalent to `go mod tidy`)
-.PHONY: deps
-deps:
-	@echo "Fetching wallet dependencies..."
+# Uses golangci-lint if installed, otherwise falls back to go vet.
+lint:
+	@command -v golangci-lint >/dev/null 2>&1 && golangci-lint run ./... || go vet ./...
+
+tidy:
 	@go mod tidy
 
-# Run the application with `make start`
-.PHONY: start
-start: build run
+clean:
+	@rm -f $(BINARY_NAME)
 
-# Run application in Docker
-.PHONY: docker-build
+migrate-up:
+	@go run $(CMD_DIR) migrate up
+
+migrate-down:
+	@go run $(CMD_DIR) migrate down
+
+# Regenerate protobuf/gRPC code. Needs protoc, protoc-gen-go and protoc-gen-go-grpc.
+proto:
+	@protoc -I $(PROTO_DIR) \
+		--go_out=paths=source_relative:$(PROTO_DIR) \
+		--go-grpc_out=paths=source_relative:$(PROTO_DIR) \
+		$(PROTO_DIR)/actors/actors.proto \
+		$(PROTO_DIR)/profile/profile.proto \
+		$(PROTO_DIR)/wallet/wallet.proto \
+		$(PROTO_DIR)/transaction/transaction.proto
+
 docker-build:
-	@echo "Building wallet Docker image..."
 	@docker build -t $(BINARY_NAME) .
 
-# Run the application in Docker (after building the image)
-.PHONY: docker-run
 docker-run:
-	@echo "Running wallet Docker container..."
-	@docker run -p 3003:3003 -p 3004:3004 $(BINARY_NAME)
+	@docker run --rm -p 3003:3003 -p 3004:3004 --env-file .env $(BINARY_NAME)
 
-# Kubernetes manifests live under internal/k8 and are assembled with kustomize.
-K8S_DIR=internal/k8
+# Docker Compose stack: postgres + redis + wallet (+ pgbouncer with --profile pooler)
+compose-up:
+	@docker compose up -d --build
 
-# Render the Kubernetes manifests (sanity-check kustomization without applying)
-.PHONY: k8s-render
+compose-down:
+	@docker compose down
+
+compose-logs:
+	@docker compose logs -f wallet
+
+compose-ps:
+	@docker compose ps
+
 k8s-render:
 	@kubectl kustomize $(K8S_DIR)
 
-# Apply the Kubernetes manifests to the current kubectl context
-.PHONY: k8s-apply
 k8s-apply:
-	@echo "Applying wallet Kubernetes manifests..."
 	@kubectl apply -k $(K8S_DIR)
 
-# Remove the Kubernetes manifests from the current kubectl context
-.PHONY: k8s-delete
 k8s-delete:
-	@echo "Deleting wallet Kubernetes manifests..."
 	@kubectl delete -k $(K8S_DIR)
-
-# Generate swagger docs
-swag:
-	@echo "Generating wallet swagger documentation...."
-	swag fmt
-	swag init -g $(CMD_DIR)/main.go -o ./docs --parseInternal true

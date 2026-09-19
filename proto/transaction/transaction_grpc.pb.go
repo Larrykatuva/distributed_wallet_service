@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.2
 // - protoc             v7.35.0
-// source: proto/transaction/transaction.proto
+// source: transaction/transaction.proto
 
 package transaction
 
@@ -20,13 +20,17 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	TransactionService_Initiate_FullMethodName = "/transaction.TransactionService/Initiate"
+	TransactionService_Get_FullMethodName      = "/transaction.TransactionService/Get"
 )
 
 // TransactionServiceClient is the client API for TransactionService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Amounts are decimal strings in major units, e.g. "110.00".
 type TransactionServiceClient interface {
-	Initiate(ctx context.Context, in *InitiateTransactionRequest, opts ...grpc.CallOption) (*InitiateTransactionResponse, error)
+	Initiate(ctx context.Context, in *InitiateTransactionRequest, opts ...grpc.CallOption) (*TransactionResponse, error)
+	Get(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*TransactionResponse, error)
 }
 
 type transactionServiceClient struct {
@@ -37,10 +41,20 @@ func NewTransactionServiceClient(cc grpc.ClientConnInterface) TransactionService
 	return &transactionServiceClient{cc}
 }
 
-func (c *transactionServiceClient) Initiate(ctx context.Context, in *InitiateTransactionRequest, opts ...grpc.CallOption) (*InitiateTransactionResponse, error) {
+func (c *transactionServiceClient) Initiate(ctx context.Context, in *InitiateTransactionRequest, opts ...grpc.CallOption) (*TransactionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(InitiateTransactionResponse)
+	out := new(TransactionResponse)
 	err := c.cc.Invoke(ctx, TransactionService_Initiate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *transactionServiceClient) Get(ctx context.Context, in *GetTransactionRequest, opts ...grpc.CallOption) (*TransactionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TransactionResponse)
+	err := c.cc.Invoke(ctx, TransactionService_Get_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -50,8 +64,11 @@ func (c *transactionServiceClient) Initiate(ctx context.Context, in *InitiateTra
 // TransactionServiceServer is the server API for TransactionService service.
 // All implementations must embed UnimplementedTransactionServiceServer
 // for forward compatibility.
+//
+// Amounts are decimal strings in major units, e.g. "110.00".
 type TransactionServiceServer interface {
-	Initiate(context.Context, *InitiateTransactionRequest) (*InitiateTransactionResponse, error)
+	Initiate(context.Context, *InitiateTransactionRequest) (*TransactionResponse, error)
+	Get(context.Context, *GetTransactionRequest) (*TransactionResponse, error)
 	mustEmbedUnimplementedTransactionServiceServer()
 }
 
@@ -62,8 +79,11 @@ type TransactionServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedTransactionServiceServer struct{}
 
-func (UnimplementedTransactionServiceServer) Initiate(context.Context, *InitiateTransactionRequest) (*InitiateTransactionResponse, error) {
+func (UnimplementedTransactionServiceServer) Initiate(context.Context, *InitiateTransactionRequest) (*TransactionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Initiate not implemented")
+}
+func (UnimplementedTransactionServiceServer) Get(context.Context, *GetTransactionRequest) (*TransactionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Get not implemented")
 }
 func (UnimplementedTransactionServiceServer) mustEmbedUnimplementedTransactionServiceServer() {}
 func (UnimplementedTransactionServiceServer) testEmbeddedByValue()                            {}
@@ -104,6 +124,24 @@ func _TransactionService_Initiate_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TransactionService_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetTransactionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransactionServiceServer).Get(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransactionService_Get_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransactionServiceServer).Get(ctx, req.(*GetTransactionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // TransactionService_ServiceDesc is the grpc.ServiceDesc for TransactionService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -115,7 +153,11 @@ var TransactionService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Initiate",
 			Handler:    _TransactionService_Initiate_Handler,
 		},
+		{
+			MethodName: "Get",
+			Handler:    _TransactionService_Get_Handler,
+		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "proto/transaction/transaction.proto",
+	Metadata: "transaction/transaction.proto",
 }

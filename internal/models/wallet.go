@@ -15,6 +15,10 @@ const (
 	WalletStatusClosed    WalletStatus = "closed"
 )
 
+// Wallet holds balances in int64 minor units (e.g. cents) to match the
+// BIGINT columns and avoid floating point rounding on money.
+//
+// Invariant: ActualBalance == AvailableBalance + ProcessingBalance.
 type Wallet struct {
 	ID                uuid.UUID    `gorm:"type:uuid;primaryKey;default:gen_random_uuid()"`
 	Number            string       `gorm:"type:text;uniqueIndex;not null"`
@@ -22,9 +26,9 @@ type Wallet struct {
 	MerchantID        *uuid.UUID   `gorm:"type:uuid;index"`
 	Status            WalletStatus `gorm:"type:wallet_status;not null;default:active"`
 	Currency          string       `gorm:"type:text;not null;default:KES;index"`
-	AvailableBalance  float64      `gorm:"not null;default:0;check:available_balance >= 0"`
-	ProcessingBalance float64      `gorm:"not null;default:0;check:processing_balance >= 0"`
-	ActualBalance     float64      `gorm:"not null;default:0;check:actual_balance >= 0"`
+	AvailableBalance  int64        `gorm:"not null;default:0;check:available_balance >= 0"`
+	ProcessingBalance int64        `gorm:"not null;default:0;check:processing_balance >= 0"`
+	ActualBalance     int64        `gorm:"not null;default:0;check:actual_balance >= 0"`
 	Checksum          string       `gorm:"type:text;not null;default:''"`
 	Version           int64        `gorm:"not null;default:0"`
 	CreatedAt         time.Time    `gorm:"not null"`

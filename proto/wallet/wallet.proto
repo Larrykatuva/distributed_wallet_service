@@ -3,8 +3,10 @@ syntax = "proto3";
 package wallet;
 option go_package = "github.com/katuva/wallet/proto/wallet";
 
+// Balances are decimal strings in major units, e.g. "150.00".
 service WalletService {
-  rpc Create(CreateWalletRequest) returns (CreateWalletResponse);
+  rpc Create(CreateWalletRequest) returns (WalletResponse);
+  rpc Get(GetWalletRequest) returns (WalletResponse);
 }
 
 message CreateWalletRequest {
@@ -13,21 +15,25 @@ message CreateWalletRequest {
   string currency    = 3;
 }
 
+message GetWalletRequest {
+  string id = 1;
+}
+
 message ProfileDto {
   string id        = 1;
   string full_name = 2;
 }
 
-message CreateWalletResponse {
+message WalletResponse {
   string     id                 = 1;
   string     created_at         = 2;
   string     updated_at         = 3;
   string     number             = 4;
   string     status             = 5;
   string     currency           = 6;
-  double     available_balance  = 7;
-  double     processing_balance = 8;
-  double     actual_balance     = 9;
+  string     available_balance  = 7;
+  string     processing_balance = 8;
+  string     actual_balance     = 9;
   int64      version            = 10;
   ProfileDto profile            = 11;
   ProfileDto merchant           = 12;

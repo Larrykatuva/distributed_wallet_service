@@ -1,7 +1,11 @@
 # `image` below defaults to the local `wallet:latest` built by `make docker-build`,
 # for use with a local cluster that shares the host's Docker daemon (e.g. Docker
 # Desktop's Kubernetes). For a real cluster, point this at your pushed image
-# instead (e.g. ghcr.io/<you>/wallet:latest) and set imagePullPolicy: Always.
+# and set imagePullPolicy: Always.
+#
+# Replica count is owned by the HPA (09-hpa.yaml); the value here is the
+# initial size only. Every pod is a Proto.Actor cluster member discovered via
+# the Kubernetes provider (pod labels cluster.proto.actor/*).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,7 +14,13 @@ metadata:
   labels:
     app.kubernetes.io/name: wallet
 spec:
-  replicas: 3
+  replicas: 6
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: wallet
@@ -18,35 +28,35 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: wallet
-        # Matched by the k8s cluster provider (internal/cluster/cluster.go) to
-        # discover peers for CLUSTER_NAME=wallet-cluster.
-        cluster: wallet-cluster
     spec:
       serviceAccountName: wallet
-      # Spread replicas across nodes so wallet actor placement is genuinely
-      # distributed rather than co-located on one node.
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: wallet
-                topologyKey: kubernetes.io/hostname
+      # SHUTDOWN_TIMEOUT (20s) + preStop (5s) must fit inside this.
+      terminationGracePeriodSeconds: 35
+      # Spread across nodes and zones so actor placement survives node loss.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: wallet
+        - maxSkew: 2
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: wallet
       initContainers:
-        # gorm.Open() does not retry — fail fast here instead of the app
-        # panicking on a nil DB connection during a cold cluster start.
-        - name: wait-for-postgres
+        # Migrations connect straight to Postgres; the app pool uses PgBouncer.
+        # Fail fast here instead of crash-looping on a cold cluster start.
+        - name: wait-for-dependencies
           image: postgres:16
           command:
             - sh
             - -c
             - |
-              until pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER"; do
-                echo "waiting for postgres at $DB_HOST:$DB_PORT..."
-                sleep 2
-              done
+              until pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER"; do echo "waiting for postgres..."; sleep 2; done
+              until pg_isready -h "$PGBOUNCER_HOST" -p "$PGBOUNCER_PORT" -U "$DB_USER"; do echo "waiting for pgbouncer..."; sleep 2; done
           envFrom:
             - configMapRef:
                 name: wallet-config
@@ -70,32 +80,53 @@ spec:
                 secretKeyRef:
                   name: wallet-secrets
                   key: DB_PASSWORD
-            # Must be the pod's own routable IP — other pods dial this
-            # directly for actor remoting over CLUSTER_PORT.
+            # Must be the pod's own routable IP: peers dial it directly for
+            # actor remoting over CLUSTER_PORT.
             - name: ADVERTISED_HOST
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-            # Keeps K8S_NAMESPACE in sync with wherever this is deployed,
-            # instead of hardcoding "wallet" in the ConfigMap.
             - name: K8S_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Match the Go scheduler to the CPU limit instead of the node's cores.
+            - name: GOMAXPROCS
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.cpu
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
+          lifecycle:
+            preStop:
+              # Let the Service endpoint removal propagate before SIGTERM so
+              # in-flight requests are not sent to a draining pod.
+              exec:
+                command: ["sh", "-c", "sleep 5"]
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 3
+            failureThreshold: 30
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /readyz
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
           livenessProbe:
-            tcpSocket:
+            httpGet:
+              path: /healthz
               port: http
-            initialDelaySeconds: 15
-            periodSeconds: 20
+            periodSeconds: 15
+            failureThreshold: 3
           resources:
             requests:
-              cpu: 250m
-              memory: 256Mi
-            limits:
               cpu: "1"
               memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi

@@ -45,6 +45,7 @@ go.work
 .env
 /.env
 .idea
+.claude
 
 /certs
 /logs

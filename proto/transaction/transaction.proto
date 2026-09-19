@@ -3,37 +3,65 @@ syntax = "proto3";
 package transaction;
 option go_package = "github.com/katuva/wallet/proto/transaction";
 
+// Amounts are decimal strings in major units, e.g. "110.00".
 service TransactionService {
-  rpc Initiate(InitiateTransactionRequest) returns (InitiateTransactionResponse);
+  rpc Initiate(InitiateTransactionRequest) returns (TransactionResponse);
+  rpc Get(GetTransactionRequest) returns (TransactionResponse);
 }
 
 message TransactionEntryDto {
   string wallet_id  = 1;
   string action     = 2; // debit | credit
-  double amount     = 3;
+  string amount     = 3; // decimal, e.g. "100.00"
   string purpose    = 4;
   bool   is_fee     = 5;
   bool   is_initial = 6;
 }
 
 message InitiateTransactionRequest {
-  string                   type         = 1; // transfer|deposit|withdrawal|payment|reversal|adjustment
-  string                   order_id     = 2;
-  string                   provider_ref = 3;
-  string                   callback_url = 4;
-  double                   total_amount = 5;
-  double                   fee          = 6;
-  string                   currency     = 7;
-  optional string          purpose      = 8;
-  optional string          description  = 9;
-  repeated TransactionEntryDto transfers = 10;
+  string                       type         = 1; // transfer|deposit|withdrawal|payment|reversal|adjustment
+  string                       order_id     = 2;
+  string                       provider_ref = 3;
+  string                       callback_url = 4;
+  string                       total_amount = 5; // decimal, includes the fee
+  string                       fee          = 6; // decimal
+  string                       merchant_id  = 11;
+  string                       currency     = 7;
+  optional string              purpose      = 8;
+  optional string              description  = 9;
+  repeated TransactionEntryDto transfers    = 10;
 }
 
-message InitiateTransactionResponse {
-  optional string order_id     = 1;
-  optional string provider_ref = 2;
-  string          rrn          = 3;
-  string          type         = 4;
-  string          status       = 5;
-  string          narration    = 6;
+// Exactly one of rrn or order_id must be set.
+message GetTransactionRequest {
+  optional string rrn      = 1;
+  optional string order_id = 2;
+}
+
+message WalletBalanceDto {
+  string wallet_id       = 1;
+  string currency        = 2;
+  string initial_balance = 3; // decimal
+  string updated_balance = 4; // decimal
+  int32  entries         = 5;
+}
+
+message TransactionResponse {
+  string          id             = 1;
+  optional string order_id       = 2;
+  optional string provider_ref   = 3;
+  string          rrn            = 4;
+  optional string callback_url   = 14;
+  string          type           = 5;
+  string          status         = 6;
+  string          narration      = 7;
+  string          amount         = 8;  // decimal
+  string          fee            = 9;  // decimal
+  string          currency       = 10;
+  bool            is_completed   = 11;
+  optional string date_completed = 12; // RFC3339
+  string          created_at     = 13; // RFC3339
+  optional string merchant_id    = 15;
+  repeated TransactionEntryDto transfers = 16;
+  repeated WalletBalanceDto    balances  = 17;
 }
