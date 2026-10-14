@@ -17,6 +17,9 @@ import (
 const (
 	defaultTimeout = 10 * time.Second
 	maxAttempts    = 3
+
+	// Builds may read the ledger; cap them so callbacks can't starve the DB pool.
+	maxConcurrentBuilds = 16
 )
 
 // Notifier POSTs the final transaction state to its callback_url.
@@ -24,6 +27,7 @@ const (
 type Notifier struct {
 	client *http.Client
 	build  func(models.Transaction, []models.WalletMovement) types.TransactionResDto
+	builds chan struct{}
 }
 
 // NewNotifier takes the payload builder so the callback carries the same
@@ -34,7 +38,11 @@ func NewNotifier(build func(models.Transaction, []models.WalletMovement) types.T
 			return types.TransactionFromModel(tx)
 		}
 	}
-	return &Notifier{client: &http.Client{Timeout: defaultTimeout}, build: build}
+	return &Notifier{
+		client: &http.Client{Timeout: defaultTimeout},
+		build:  build,
+		builds: make(chan struct{}, maxConcurrentBuilds),
+	}
 }
 
 // Notify returns immediately; payload building and delivery happen off the
@@ -43,7 +51,13 @@ func (n *Notifier) Notify(tx models.Transaction, movements []models.WalletMoveme
 	if tx.CallbackURL == nil || *tx.CallbackURL == "" {
 		return
 	}
-	go n.deliver(*tx.CallbackURL, n.build(tx, movements))
+	url := *tx.CallbackURL
+	go func() {
+		n.builds <- struct{}{}
+		payload := n.build(tx, movements)
+		<-n.builds
+		n.deliver(url, payload)
+	}()
 }
 
 func (n *Notifier) deliver(url string, payload types.TransactionResDto) {

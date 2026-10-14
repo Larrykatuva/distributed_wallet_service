@@ -26,7 +26,8 @@ func DSN(cfg *config.Config) string {
 // still binary and still cached client-side) and GORM statement caching is off.
 func AppDSN(cfg *config.Config) (dsn string, prepared bool) {
 	if !cfg.UsePgBouncer {
-		return DSN(cfg), true
+		// Plan with real values so partition pruning happens before locking.
+		return DSN(cfg) + " plan_cache_mode=force_custom_plan", true
 	}
 	dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		cfg.PgBouncerHost, cfg.PgBouncerPort, cfg.DbUser, cfg.DbPassword, cfg.DbName, cfg.DbSSLMode)
@@ -40,7 +41,7 @@ func AppDSN(cfg *config.Config) (dsn string, prepared bool) {
 // Callers should treat an error as fatal: nothing works without the database.
 func Connect(cfg *config.Config) (*gorm.DB, error) {
 	dsn, prepared := AppDSN(cfg)
-	gdb, err := Open(dsn, prepared)
+	gdb, err := Open(dsn, prepared, cfg.DbMaxOpenConns, cfg.DbMaxIdleConns)
 	if err != nil {
 		return nil, err
 	}
@@ -53,10 +54,10 @@ func Connect(cfg *config.Config) (*gorm.DB, error) {
 	return gdb, nil
 }
 
-// Open connects to the given DSN with the pool settings the service expects.
+// Open connects to the given DSN with the given pool sizes.
 // prepared enables GORM's prepared-statement cache; disable it behind a
 // transaction-mode pooler.
-func Open(dsn string, prepared bool) (*gorm.DB, error) {
+func Open(dsn string, prepared bool, maxOpen, maxIdle int) (*gorm.DB, error) {
 	gdb, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		NamingStrategy: schema.NamingStrategy{SingularTable: true},
 		Logger:         gormlogger.Default.LogMode(gormlogger.Error),
@@ -75,8 +76,9 @@ func Open(dsn string, prepared bool) (*gorm.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unwrap sql.DB: %w", err)
 	}
-	sqlDB.SetMaxOpenConns(25)
-	sqlDB.SetMaxIdleConns(10)
+	// Idle == open so a burst does not close and reopen connections.
+	sqlDB.SetMaxOpenConns(maxOpen)
+	sqlDB.SetMaxIdleConns(min(maxIdle, maxOpen))
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 
 	if err = sqlDB.Ping(); err != nil {

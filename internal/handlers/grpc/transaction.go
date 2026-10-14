@@ -92,9 +92,9 @@ func (h *TransactionGrpcHandler) Get(_ context.Context, req *pb.GetTransactionRe
 	)
 	switch {
 	case req.Rrn != nil && *req.Rrn != "":
-		result, err = h.transactions.GetByRRN(*req.Rrn)
+		result, err = h.transactions.GetByRRN(*req.Rrn, req.Date)
 	case req.OrderId != nil && *req.OrderId != "":
-		result, err = h.transactions.GetByOrderID(*req.OrderId)
+		result, err = h.transactions.GetByOrderID(*req.OrderId, req.Date)
 	default:
 		return nil, toStatus(validation.FieldErrors{"rrn": "or order_id is required"})
 	}

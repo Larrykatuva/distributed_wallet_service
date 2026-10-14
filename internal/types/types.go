@@ -82,6 +82,17 @@ type TransactionReqDto struct {
 	Transfers   []TransactionEntryDto  `json:"transfers"     validate:"required,min=2,dive"`
 }
 
+// TransactionReverseReqDto asks for a successful transaction to be undone.
+// The legs are derived from the original's ledger; callback_url defaults to
+// the original's. transaction_date is the original's creation date, which
+// bounds the lookup to its partition.
+type TransactionReverseReqDto struct {
+	RRN             string  `json:"rrn"              validate:"required"`
+	TransactionDate string  `json:"transaction_date" validate:"required,datetime=2006-01-02"`
+	CallbackUrl     *string `json:"callback_url"     validate:"omitempty,url"`
+	Description     *string `json:"description"`
+}
+
 // TransactionLegDto is a transfer leg as returned with a transaction.
 type TransactionLegDto struct {
 	WalletID  uuid.UUID         `json:"wallet_id"`

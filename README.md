@@ -10,6 +10,7 @@ A high-performance distributed wallet payment system built in Go, leveraging the
 - [Architecture](#architecture)
 - [Transaction Flow](#transaction-flow)
 - [Concurrency Model](#concurrency-model)
+- [Performance](#performance)
 - [Project Structure](#project-structure)
 - [Data Models](#data-models)
 - [Getting Started](#getting-started)
@@ -128,11 +129,13 @@ Amounts are decimals in the currency's major units (a JSON number or a string). 
 7. TransactionActor updates transaction status → processing
         │
         ▼
-8. TransactionActor fans out all transfers (non-blocking ctx.Request)
+8. TransactionActor sends the debits first (non-blocking ctx.Request)
    ├── ctx.Request(WalletActor-A, DebitWalletMsg{amount: 10890})
-   ├── ctx.Request(WalletActor-A, DebitWalletMsg{amount: 100})
+   └── ctx.Request(WalletActor-A, DebitWalletMsg{amount: 100})
+   ...and only once every debit has applied, the credits
    ├── ctx.Request(WalletActor-B, CreditWalletMsg{amount: 10890})
    └── ctx.Request(WalletActor-C, CreditWalletMsg{amount: 100})
+   (a refused debit means no credit is ever sent)
         │
         ▼ (replies arrive asynchronously)
 9. Each WalletActor processes its message:
@@ -210,8 +213,8 @@ Every path that can lose a message has a resolution; nothing is only logged.
 
 | Event | Resolution |
 |---|---|
-| Wallet does not reply within `TRANSACTION_TIMEOUT` | The silent leg is marked failed (`timeout`); applied legs are reversed; transaction → `failed` |
-| Debit/Credit message dead-lettered (wallet actor unreachable) | The dead-letter handler answers the orchestrator with an `undeliverable` result, so it fails the leg and reverses the rest immediately |
+| Wallet does not reply within `TRANSACTION_TIMEOUT` | Nothing fails: the leg keeps waiting (a slow wallet still answers), the orchestrator refreshes `updated_at` every tick so the sweeper leaves it alone |
+| Debit/Credit message dead-lettered, or an `internal_error` / `version_conflict` reply | The copy is known to be finished, so the orchestrator re-sends the leg under the same idempotency key on the next tick |
 | Start / reply / finalize / timeout message dead-lettered (orchestrator gone) | The recovery manager re-drives the transaction from its persisted plan (`transactions.transfers`) |
 | Transaction incomplete and unchanged for `RECOVERY_STALE_AFTER` (node crash, lost final write) | The sweeper (every `RECOVERY_SWEEP_INTERVAL`) re-drives it the same way |
 | Re-driven more than `RECOVERY_MAX_ATTEMPTS` times | Marked `failed`; if ledger rows exist the narration says "reconciliation required" and the callback is sent |
@@ -274,6 +277,56 @@ After every balance change, a SHA-256 checksum of `id:actual:available:processin
 ### Messages cross nodes as protobuf
 
 Proto.Actor remoting only serialises `proto.Message` values, so every actor message is defined in `proto/actors/actors.proto`. Errors travel as string codes, never as Go `error` values.
+
+---
+
+## Performance
+
+A single node sustained **1,500 transactions per second** with millisecond latency, using about one core for the service and one and a half for Postgres.
+
+### Setup
+
+| |                                                                                                                                                             |
+|---|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Machine | One MacBook Pro, Apple M1 Pro (8 cores), 32 GB RAM                                                                                                          |
+| On that machine | The service (`CLUSTER_MODE=single`), Postgres 17, Redis and the load generator, with IDEs also running                                                      |
+| Database | Direct connection, `DB_MAX_OPEN_CONNS=50`, monthly partitions                                                                                               |
+| Traffic | 50 merchants, each with its own merchant and fee wallet; 1,000 customer wallets; 80% customer→merchant payments (with fee), 20% customer→customer transfers |
+| Load | Open loop at a fixed 1,500 initiates/s for 3s, each with a `callback_url` the generator receives                                                            |
+
+### Results at 1,500/s
+
+| Metric | Result |
+|---|---|
+| Throughput | **~1,500/s** sustained; 29,961 transactions, all accepted (`202`) |
+| `POST /initiate` latency | **p50 1.0 ms**, p90 13 ms, p99 ~150 ms |
+| Initiate → callback (settled and notified) | **p50 4.2 ms**, p90 ~350 ms, p99 ~1.0 s, max 1.3 s; every callback received |
+| Postgres CPU | ~1.5 of 8 cores |
+| Service CPU | ~1 of 8 cores |
+| Database connections | 42 of 50 idle on average |
+
+### Correctness under load
+
+Checked against the database after the run (1,100 wallets, 138,752 ledger rows):
+
+- every wallet balance equals its ledger (credits − debits);
+- every ledger row starts where the previous one for its wallet ended;
+- no idempotency key was applied twice;
+- every successful transaction's ledger matches its plan leg for leg;
+- no transaction needed reconciliation.
+
+A separate overload test (all traffic on one merchant, 58,524 transactions queued far past `TRANSACTION_TIMEOUT`) completed every transaction with the same checks passing and no reconciliation.
+
+### What made the difference
+
+- **Debits before credits.** A refused debit never credits anyone, so a failed payment is one cheap wallet operation and nothing has to be clawed back.
+- **Every query bounded by date.** Lookups take the transaction `date`, and internal queries bound `created_at` on both sides, so Postgres reads one partition and lock contention stays low.
+- **Slow is not failed.** Legs wait for the wallet instead of timing out into reversals.
+- **Off the actor's path.** Webhook payloads are built in the background; wallet metadata comes from Redis in one round trip; access logs are written asynchronously.
+
+### Not covered yet
+
+Most customers in this run had no balance, so most payments ended at the debit; a successful payment does more work (debit, then credits and their ledger rows). Successful payments at volume, cluster mode across several nodes, and PgBouncer have not been measured yet.
 
 ---
 
@@ -441,7 +494,7 @@ kubectl create secret generic wallet-secrets --namespace wallet \
 | `GRPC_PORT` | `3004` | gRPC server port |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:*` | Comma-separated allowed origins |
 | `SHUTDOWN_TIMEOUT` | `15s` | Grace period for draining on SIGTERM |
-| `TRANSACTION_TIMEOUT` | `30s` | Per-stage wait for wallet replies before failing silent legs |
+| `TRANSACTION_TIMEOUT` | `30s` | Tick for re-sending undelivered legs and heartbeats; slow legs never fail. Keep well below `RECOVERY_STALE_AFTER` |
 | `RECOVERY_STALE_AFTER` | `2m` | Incomplete transactions unchanged this long are re-driven |
 | `RECOVERY_SWEEP_INTERVAL` | `30s` | How often the sweeper looks for stuck transactions |
 | `RECOVERY_MAX_ATTEMPTS` | `5` | Re-drives before a transaction is marked failed for reconciliation |
@@ -463,6 +516,8 @@ kubectl create secret generic wallet-secrets --namespace wallet \
 | `DB_USER` | `postgres` | Database user |
 | `DB_PASSWORD` | `` (empty) | Database password |
 | `DB_SSLMODE` | `disable` | Postgres `sslmode` |
+| `DB_MAX_OPEN_CONNS` | `50` | Application connection pool size per process |
+| `DB_MAX_IDLE_CONNS` | `DB_MAX_OPEN_CONNS` | Idle connections kept open |
 | `USE_PGBOUNCER` | `false` | Route the application pool through PgBouncer |
 | `PGBOUNCER_HOST` | `127.0.0.1` | PgBouncer host |
 | `PGBOUNCER_PORT` | `6432` | PgBouncer port |
@@ -492,12 +547,14 @@ Mounted under `/v1`. Health: `GET /healthz` (liveness), `GET /readyz` (pings the
 | `GET` | `/v1/wallet/profile/{profileId}` | Wallets owned by a profile, paginated; optional `merchant_id`, `currency`, `status` |
 | `POST` | `/v1/transaction/initiate` | Initiate a transaction → `202`, status `pending` |
 | `GET` | `/v1/transaction` | List transactions, paginated; filters `merchant_id`, `profile_id`, `wallet_id`, `status`, `type`, `order_id`, `provider_ref`, `from`, `to` |
-| `GET` | `/v1/transaction/{id}` | Transaction by id, with `transfers` and `balances` |
-| `GET` | `/v1/transaction/rrn/{rrn}` | Transaction by RRN, with `transfers` and `balances` |
-| `GET` | `/v1/transaction/order/{orderId}` | Transaction by caller `order_id`, with `transfers` and `balances` |
-| `POST` | `/v1/transaction/rrn/{rrn}/resend-callback` | Re-deliver the completion webhook → `202 {"message": "callback queued for delivery"}` |
+| `GET` | `/v1/transaction/{id}?date=YYYY-MM-DD` | Transaction by id, with `transfers` and `balances` |
+| `GET` | `/v1/transaction/rrn/{rrn}?date=YYYY-MM-DD` | Transaction by RRN, with `transfers` and `balances` |
+| `GET` | `/v1/transaction/order/{orderId}?date=YYYY-MM-DD` | Transaction by caller `order_id`, with `transfers` and `balances` |
+| `POST` | `/v1/transaction/rrn/{rrn}/resend-callback?date=YYYY-MM-DD` | Re-deliver the completion webhook → `202 {"message": "callback queued for delivery"}` |
 
 **Pagination.** Listings take `page` (1-based, default 1) and `page_size` (default 20, max 100) and return `{"data": [...], "page": n, "page_size": n, "total": n}`. Transaction listings default to the last 30 days; pass `from`/`to` (RFC3339 or `YYYY-MM-DD`) for another window. The window is what lets Postgres prune partitions, so keep it as narrow as you can.
+
+**Transaction `date`.** Lookups by id, RRN or order id (and resend-callback) require `date`, the transaction's creation date from the initiate response's `created_at`. It bounds the search to that day, padded a day each side for time zones, so Postgres reads one monthly partition. A missing or malformed `date` is a `400`; a wrong one is a `404`.
 
 ### gRPC
 
@@ -507,7 +564,7 @@ Served on `GRPC_PORT`, with server reflection and the standard health service.
 |---|---|---|
 | `profile.ProfileService` | `Register` | Register a profile |
 | `wallet.WalletService` | `Create`, `Get` | Create / read a wallet |
-| `transaction.TransactionService` | `Initiate`, `Get` | Initiate / read a transaction |
+| `transaction.TransactionService` | `Initiate`, `Get` | Initiate / read a transaction (`Get` takes `rrn` or `order_id`, plus `date`) |
 
 Listing, lookup-by-number/username and resend-callback are HTTP-only for now.
 

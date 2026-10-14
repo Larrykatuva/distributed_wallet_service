@@ -1,46 +1,28 @@
 package utils
 
 import (
-	"encoding/base64"
+	"crypto/rand"
 	"encoding/json"
 	"net"
 	"net/http"
-	"regexp"
 	"strings"
-	"time"
 )
 
-func generateTransactionNumber() string {
-	ticks := time.Now().UnixNano()
-	bytes := make([]byte, 8)
-	for i := 0; i < 8; i++ {
-		bytes[i] = byte(ticks >> (i * 8))
-	}
-	id := base64.StdEncoding.EncodeToString(bytes)
-	id = strings.ReplaceAll(id, "+", " ")
-	id = strings.ReplaceAll(id, "/", " ")
-	id = strings.TrimRight(id, "=")
-	return id
-}
+const rrnAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
-func removeSpecialChars(refNo string) string {
-	reg := regexp.MustCompile("[!@#$%\\^&*\\(\\)_+=\\/\\\\{\\}\\[\\]\\|/:;/\"'<>,.\\?\\~`;]")
-	return reg.ReplaceAllString(refNo, "")
-}
-
-func reverseString(s string) string {
-	runes := []rune(s)
-	n := len(runes)
-	for i := 0; i < n/2; i++ {
-		runes[i], runes[n-1-i] = runes[n-1-i], runes[i]
-	}
-	return string(runes)
-}
-
+// GenerateRrn returns a random 12-character reference (about 62 bits).
 func GenerateRrn() string {
-	noSpaces := strings.ReplaceAll(removeSpecialChars(generateTransactionNumber()), " ", "")
-	upper := strings.ToUpper(noSpaces)
-	return reverseString(upper)
+	out := make([]byte, 0, 12)
+	buf := make([]byte, 24)
+	for len(out) < cap(out) {
+		_, _ = rand.Read(buf)
+		for _, c := range buf {
+			if c < 252 && len(out) < cap(out) { // 252 = 7*36 keeps every symbol equally likely
+				out = append(out, rrnAlphabet[c%36])
+			}
+		}
+	}
+	return string(out)
 }
 
 // CastData is a utility function that marshals the source data (src) into JSON,

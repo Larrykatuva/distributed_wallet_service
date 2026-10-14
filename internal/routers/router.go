@@ -40,6 +40,7 @@ func Router(svc Services) *chi.Mux {
 
 	r.Route("/transaction", func(tr chi.Router) {
 		tr.Post("/initiate", transactions.Initiate)
+		tr.Post("/reverse", transactions.Reverse)
 		tr.Get("/", transactions.List)
 		tr.Get("/rrn/{rrn}", transactions.GetByRRN)
 		tr.Post("/rrn/{rrn}/resend-callback", transactions.ResendCallback)

@@ -23,8 +23,7 @@ var uuidPattern = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
 // only logging them:
 //
 //   - a wallet op that never reached its actor is answered on the sender's
-//     behalf with an "undeliverable" result, so the orchestrator fails the leg
-//     and reverses the others;
+//     behalf with an "undeliverable" result, so the orchestrator re-sends it;
 //   - a lost start, lost reply, lost timeout or lost finalize hands the
 //     transaction to the recovery manager, which re-drives it from the
 //     persisted plan and the ledger.
@@ -76,9 +75,8 @@ func RegisterDeadLetterHandler(system *actor.ActorSystem, recoverer Recoverer) {
 	})
 }
 
-// answerUndeliverable replies to the orchestrator as the wallet would have,
-// with an error, so the transaction fails cleanly instead of hanging until
-// its timeout. Without a sender it falls back to full recovery.
+// answerUndeliverable tells the orchestrator the op never arrived, so it
+// re-sends it. Without a sender it falls back to full recovery.
 func answerUndeliverable(system *actor.ActorSystem, sender *actor.PID, recoverer Recoverer, txID, walletID, key string, amount int64) {
 	if sender == nil {
 		recoverByID(recoverer, txID, "wallet message undeliverable, no sender")

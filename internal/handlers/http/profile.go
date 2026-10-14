@@ -33,7 +33,7 @@ func (h *ProfileHandler) Register(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, profile)
 }
 
-// List: GET /profile?external_id=&type=&search=&page=&page_size=
+// List GET /profile?external_id=&type=&search=&page=&page_size=
 func (h *ProfileHandler) List(w http.ResponseWriter, r *http.Request) {
 	fe := validation.FieldErrors{}
 	f := types.ProfileFilter{ExternalID: queryString(r, "external_id"), Search: queryString(r, "search")}
@@ -71,7 +71,7 @@ func (h *ProfileHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, profile)
 }
 
-// GetByUsername: GET /profile/username/{username} where username is an email or phone.
+// GetByUsername GET /profile/username/{username} where username is an email or phone.
 func (h *ProfileHandler) GetByUsername(w http.ResponseWriter, r *http.Request) {
 	profile, err := h.profiles.GetByUsername(chi.URLParam(r, "username"))
 	if err != nil {

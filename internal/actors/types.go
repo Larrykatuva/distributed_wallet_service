@@ -29,6 +29,17 @@ const (
 	CodeInternal           ErrorCode = "internal_error"
 )
 
+// Definitive codes are final refusals; any other code leaves the outcome
+// unknown and the leg is re-sent under the same key.
+func (c ErrorCode) Definitive() bool {
+	switch c {
+	case CodeInsufficientFunds, CodeInactiveWallet, CodeWalletNotFound,
+		CodeWalletMismatch, CodeChecksumMismatch, CodeInvalidMessage:
+		return true
+	}
+	return false
+}
+
 // WalletError is returned by WalletActor operations and mapped onto the
 // error_code / error_message fields of WalletResultMsg.
 type WalletError struct {

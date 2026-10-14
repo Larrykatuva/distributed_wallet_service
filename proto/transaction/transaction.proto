@@ -32,10 +32,12 @@ message InitiateTransactionRequest {
   repeated TransactionEntryDto transfers    = 10;
 }
 
-// Exactly one of rrn or order_id must be set.
+// Exactly one of rrn or order_id must be set; date is the transaction's
+// creation date (YYYY-MM-DD).
 message GetTransactionRequest {
   optional string rrn      = 1;
   optional string order_id = 2;
+  string date              = 3;
 }
 
 message WalletBalanceDto {

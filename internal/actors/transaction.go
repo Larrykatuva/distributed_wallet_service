@@ -6,16 +6,21 @@ import (
 	"github.com/asynkron/protoactor-go/actor"
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/google/uuid"
+	"github.com/katuva/wallet/dpk/cache"
 	"github.com/katuva/wallet/dpk/logger"
 	"github.com/katuva/wallet/internal/models"
 	pb "github.com/katuva/wallet/proto/actors"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // stage is the TransactionActor lifecycle. Transitions only move forward:
 //
-//	idle → processing → (all applied) → finalized
-//	                  → (any failed)  → reversing → finalized
+//	idle → processing (debits) → crediting (credits) → finalized
+//	       any refusal in either → reversing → finalized
+//
+// Credits are sent only once every debit has applied, so a refused debit
+// never leaves money with a recipient that has to be clawed back.
 type stage int
 
 const (
@@ -23,13 +28,21 @@ const (
 	stageProcessing
 	stageReversing
 	stageFinalized
+	stageCrediting
 )
 
-// DefaultReplyTimeout bounds how long the orchestrator waits for wallet
-// replies in each stage before treating the silent legs as failed.
+// DefaultReplyTimeout is the tick at which the orchestrator re-sends legs that
+// need it and reports it is alive. A slow leg is never failed.
 const DefaultReplyTimeout = 30 * time.Second
 
+// maxLogEvery caps the backoff, in ticks, of the "still waiting" log line.
+const maxLogEvery = 16
+
 const finalizeAttempts = 3
+
+// reversalLookback bounds how far back a reversal looks for its original
+// (mirrors the service lookup window) so Postgres can prune partitions.
+const reversalLookback = 400 * 24 * time.Hour
 
 // transfer is the actor's private bookkeeping for one leg of the transaction.
 type transfer struct {
@@ -47,6 +60,7 @@ type transfer struct {
 
 	done    bool // reply received for the in-flight op
 	applied bool // original op moved the balance
+	retry   bool // re-send at the next tick; set only when no copy is in flight
 
 	failCode ErrorCode
 	failMsg  string
@@ -81,9 +95,9 @@ type NoopNotifier struct{}
 
 func (NoopNotifier) Notify(models.Transaction, []models.WalletMovement) {}
 
-// TransactionActor orchestrates one transaction: it fans debits and credits out
-// to the owning WalletActors, collects replies, reverses applied legs if any
-// leg failed, writes the final status, notifies, and then stops itself.
+// TransactionActor orchestrates one transaction: it applies the debits, then
+// the credits, on the owning WalletActors, reverses applied legs if any leg
+// failed, writes the final status, notifies, and then stops itself.
 //
 // It can also resume a transaction whose previous orchestrator was lost: with
 // StartTransactionMsg.resume it reconstructs progress from the ledger rows
@@ -99,6 +113,7 @@ type TransactionActor struct {
 	transfers     []transfer
 	stage         stage
 	timer         *time.Timer
+	ticks         int // timer ticks in the current stage
 	replies       int // arrival counter for ordering wallet replies
 }
 
@@ -133,7 +148,7 @@ func (t *TransactionActor) Receive(ctx actor.Context) {
 		t.collect(ctx, msg)
 
 	case *pb.TransactionTimeoutMsg:
-		t.timeout(ctx, stage(msg.Stage))
+		t.tick(ctx, stage(msg.Stage))
 
 	case *pb.FinalizeTransactionMsg:
 		t.finalize(ctx)
@@ -145,6 +160,12 @@ func (t *TransactionActor) Receive(ctx actor.Context) {
 
 func (t *TransactionActor) start(ctx actor.Context, msg *pb.StartTransactionMsg) {
 	if t.stage != stageIdle {
+		if msg.Resume && t.working() {
+			logger.WarningLog.Printf("txn %s: resume while in progress (stage %d), still waiting", msg.TransactionId, t.stage)
+			t.resendPending(ctx)
+			t.heartbeat()
+			return
+		}
 		logger.WarningLog.Printf("txn %s: duplicate StartTransactionMsg ignored (stage %d)", msg.TransactionId, t.stage)
 		return
 	}
@@ -176,7 +197,7 @@ func (t *TransactionActor) start(ctx actor.Context, msg *pb.StartTransactionMsg)
 		allowed = append(allowed, models.TransactionStatusProcessing)
 	}
 	res := t.db.Model(&models.Transaction{}).
-		Where("id = ? AND created_at >= ? AND status IN ?", t.transactionID, t.createdAt, allowed).
+		Scopes(t.ownRow).Where("status IN ?", allowed).
 		Updates(map[string]any{"status": models.TransactionStatusProcessing, "updated_at": time.Now()})
 	if res.Error != nil {
 		logger.ErrorLog.Printf("txn %s: could not mark processing: %v", t.transactionID, res.Error)
@@ -194,7 +215,7 @@ func (t *TransactionActor) start(ctx actor.Context, msg *pb.StartTransactionMsg)
 	}
 
 	t.stage = stageProcessing
-	t.fireTransfers(ctx)
+	t.fireLegs(ctx)
 	t.armTimeout(ctx)
 	t.advance(ctx)
 }
@@ -227,7 +248,7 @@ func (t *TransactionActor) loadTransfers(entries []*pb.TransferEntry) bool {
 func (t *TransactionActor) resume(ctx actor.Context) {
 	var keys []uuid.UUID
 	err := t.db.Model(&models.Ledger{}).
-		Where("transaction_id = ? AND created_at >= ?", t.transactionID, t.createdAt).
+		Where("transaction_id = ? AND created_at >= ? AND created_at < ?", t.transactionID, t.createdAt, time.Now().Add(24*time.Hour)).
 		Pluck("idempotency_key", &keys).Error
 	if err != nil {
 		logger.ErrorLog.Printf("txn %s: resume could not read ledger: %v", t.transactionID, err)
@@ -251,50 +272,93 @@ func (t *TransactionActor) resume(ctx actor.Context) {
 	if reversing {
 		// The lost orchestrator had already decided to fail this transaction.
 		t.stage = stageReversing
+		persist := false
 		for i := range t.transfers {
 			tr := &t.transfers[i]
 			if tr.failCode == "" && !tr.applied {
 				tr.failCode, tr.failMsg = CodeUndeliverable, "leg did not apply before recovery"
 			}
+			if tr.applied && !tr.reversed && tr.reversalKey == nil {
+				k := uuid.New()
+				tr.reversalKey, persist = &k, true
+			}
+		}
+		if persist {
+			t.persistPlan()
+		}
+		for i := range t.transfers {
+			tr := &t.transfers[i]
 			switch {
 			case !tr.applied, tr.reversed:
 				tr.done = true
 			default:
 				tr.done = false
-				if !t.send(ctx, tr, tr.action.Opposite(), *tr.reversalKey) {
-					tr.done, tr.reversalErr = true, "wallet actor unavailable"
-				}
+				tr.retry = !t.send(ctx, tr, tr.action.Opposite(), *tr.reversalKey)
 			}
 		}
 		logger.InfoLog.Printf("txn %s: resumed in reversing stage", t.transactionID)
 	} else {
 		t.stage = stageProcessing
+		if t.debitsApplied() {
+			t.stage = stageCrediting
+		}
 		for i := range t.transfers {
 			tr := &t.transfers[i]
 			if tr.applied {
 				tr.done = true
-				continue
-			}
-			if !t.send(ctx, tr, tr.action, tr.key) {
-				tr.done, tr.failCode, tr.failMsg = true, CodeClusterUnavailable, "wallet actor unavailable"
 			}
 		}
-		logger.InfoLog.Printf("txn %s: resumed in processing stage", t.transactionID)
+		t.fireLegs(ctx)
+		logger.InfoLog.Printf("txn %s: resumed in stage %d", t.transactionID, t.stage)
 	}
 
 	t.armTimeout(ctx)
 	t.advance(ctx)
 }
 
-// fireTransfers sends every leg to its wallet actor. ctx.Request is
-// non-blocking; replies arrive later as WalletResultMsg.
-func (t *TransactionActor) fireTransfers(ctx actor.Context) {
+// fireLegs sends the current stage's legs (debits, or credits) that have not
+// applied yet. ctx.Request is non-blocking; replies arrive later as
+// WalletResultMsg. A leg that cannot be sent is retried on the next tick.
+func (t *TransactionActor) fireLegs(ctx actor.Context) {
 	for i := range t.transfers {
 		tr := &t.transfers[i]
-		if !t.send(ctx, tr, tr.action, tr.key) {
-			tr.done, tr.failCode, tr.failMsg = true, CodeClusterUnavailable, "wallet actor unavailable"
+		if tr.done || !t.inStage(tr) {
+			continue
+		}
+		tr.retry = !t.send(ctx, tr, tr.action, tr.key)
+	}
+}
+
+// fireCredits starts the credit stage once every debit has applied.
+func (t *TransactionActor) fireCredits(ctx actor.Context) {
+	t.stage = stageCrediting
+	t.ticks = 0
+	t.fireLegs(ctx)
+	t.armTimeout(ctx)
+}
+
+// inStage reports whether a leg is worked on in the current stage.
+func (t *TransactionActor) inStage(tr *transfer) bool {
+	switch t.stage {
+	case stageProcessing:
+		return tr.action == models.LedgerTypeDebit
+	case stageCrediting:
+		return tr.action == models.LedgerTypeCredit
+	}
+	return true
+}
+
+func (t *TransactionActor) working() bool {
+	return t.stage == stageProcessing || t.stage == stageCrediting || t.stage == stageReversing
+}
+
+func (t *TransactionActor) debitsApplied() bool {
+	for i := range t.transfers {
+		if t.transfers[i].action == models.LedgerTypeDebit && !t.transfers[i].applied {
+			return false
 		}
 	}
+	return true
 }
 
 // fireReversals sends the compensating operation to every leg that was
@@ -302,6 +366,7 @@ func (t *TransactionActor) fireTransfers(ctx actor.Context) {
 // Keys are persisted first so a recovery can finish the same reversal.
 func (t *TransactionActor) fireReversals(ctx actor.Context) {
 	t.stage = stageReversing
+	t.ticks = 0
 
 	for i := range t.transfers {
 		tr := &t.transfers[i]
@@ -315,13 +380,11 @@ func (t *TransactionActor) fireReversals(ctx actor.Context) {
 	for i := range t.transfers {
 		tr := &t.transfers[i]
 		if !tr.applied {
-			tr.done = true // nothing to undo
+			tr.done, tr.retry = true, false // nothing to undo
 			continue
 		}
 		tr.done = false
-		if !t.send(ctx, tr, tr.action.Opposite(), *tr.reversalKey) {
-			tr.done, tr.reversalErr = true, "wallet actor unavailable"
-		}
+		tr.retry = !t.send(ctx, tr, tr.action.Opposite(), *tr.reversalKey)
 	}
 	t.armTimeout(ctx)
 }
@@ -347,35 +410,46 @@ func (t *TransactionActor) send(ctx actor.Context, tr *transfer, action models.L
 }
 
 // collect records one wallet reply against the leg whose in-flight key matches.
+// A leg settles only on success or a definitive refusal. Any other answer means
+// that copy is finished without a verdict, so the leg is re-sent under its key.
 func (t *TransactionActor) collect(ctx actor.Context, msg *pb.WalletResultMsg) {
-	if t.stage != stageProcessing && t.stage != stageReversing {
+	if !t.working() {
 		return
 	}
+	code := ErrorCode(msg.ErrorCode)
 
 	for i := range t.transfers {
 		tr := &t.transfers[i]
-		if tr.done || tr.inFlightKey(t.stage) != msg.IdempotencyKey {
+		if tr.inFlightKey(t.stage) != msg.IdempotencyKey {
 			continue
 		}
-		tr.done = true
-		t.replies++
-
-		switch t.stage {
-		case stageProcessing:
-			if msg.ErrorCode == "" {
-				tr.applied = true
-				tr.initial, tr.updated, tr.seq = msg.InitialBalance, msg.UpdatedBalance, t.replies
-			} else {
-				tr.failCode = ErrorCode(msg.ErrorCode)
-				tr.failMsg = msg.ErrorMessage
+		switch {
+		case tr.done:
+			if code == "" && tr.failCode != "" && !tr.applied {
+				t.lateApply(ctx, tr, msg)
 			}
-		case stageReversing:
-			if msg.ErrorCode == "" {
+		case code == "":
+			tr.done = true
+			t.replies++
+			if t.stage == stageReversing {
 				tr.reversed = true
 				tr.rInitial, tr.rUpdated, tr.rSeq = msg.InitialBalance, msg.UpdatedBalance, t.replies
 			} else {
-				tr.reversalErr = msg.ErrorCode + ": " + msg.ErrorMessage
+				tr.applied = true
+				tr.initial, tr.updated, tr.seq = msg.InitialBalance, msg.UpdatedBalance, t.replies
 			}
+		case code.Definitive():
+			tr.done = true
+			t.replies++
+			if t.stage == stageReversing {
+				tr.reversalErr = msg.ErrorCode + ": " + msg.ErrorMessage
+			} else {
+				tr.failCode, tr.failMsg = code, msg.ErrorMessage
+			}
+		default:
+			tr.retry = true
+			logger.WarningLog.Printf("txn %s: wallet %s answered %s (%s), re-sending next tick",
+				t.transactionID, tr.walletID, code, msg.ErrorMessage)
 		}
 		break
 	}
@@ -383,27 +457,83 @@ func (t *TransactionActor) collect(ctx actor.Context, msg *pb.WalletResultMsg) {
 	t.advance(ctx)
 }
 
-// timeout marks every leg still awaiting a reply in the given stage as failed
-// and lets the lifecycle continue (reversal, then finalize).
-func (t *TransactionActor) timeout(ctx actor.Context, armed stage) {
-	if t.stage != armed || t.stage == stageFinalized {
+// lateApply handles a leg applied after it was refused (e.g. a resumed
+// orchestrator re-sent it while the original was queued): it gets reversed.
+func (t *TransactionActor) lateApply(ctx actor.Context, tr *transfer, msg *pb.WalletResultMsg) {
+	logger.ErrorLog.Printf("txn %s: wallet %s applied %s %d after refusing it; reversing it",
+		t.transactionID, tr.walletID, tr.action, tr.amount)
+	t.replies++
+	tr.applied = true
+	tr.initial, tr.updated, tr.seq = msg.InitialBalance, msg.UpdatedBalance, t.replies
+	if t.stage != stageReversing {
+		return // fireReversals undoes it with the other applied legs
+	}
+	k := uuid.New()
+	tr.reversalKey = &k
+	t.persistPlan()
+	tr.done = false
+	tr.retry = !t.send(ctx, tr, tr.action.Opposite(), k)
+}
+
+// tick runs every replyTimeout while legs are outstanding. Nothing fails here
+// and a leg still in flight is never re-sent: a slow wallet will answer, and a
+// second copy could apply after the first was refused. updated_at is refreshed
+// so the recovery sweeper leaves this live transaction alone.
+func (t *TransactionActor) tick(ctx actor.Context, armed stage) {
+	if t.stage != armed || !t.working() {
 		return
 	}
+	t.ticks++
+	pending := t.resendPending(ctx)
+	if pending == 0 {
+		return
+	}
+	if t.ticks >= 4 && (t.ticks&(t.ticks-1) == 0 || t.ticks%maxLogEvery == 0) {
+		logger.WarningLog.Printf("txn %s: %d leg(s) still awaiting wallet replies after %s (stage %d)",
+			t.transactionID, pending, time.Duration(t.ticks)*t.replyTimeout, t.stage)
+	}
+	t.heartbeat()
+	t.armTimeout(ctx)
+}
+
+// resendPending re-sends the legs marked for retry and returns how many legs
+// are outstanding.
+func (t *TransactionActor) resendPending(ctx actor.Context) int {
+	pending := 0
 	for i := range t.transfers {
 		tr := &t.transfers[i]
-		if tr.done {
+		if tr.done || !t.inStage(tr) {
 			continue
 		}
-		tr.done = true
-		switch t.stage {
-		case stageProcessing:
-			tr.failCode, tr.failMsg = CodeTimeout, "no reply within "+t.replyTimeout.String()
-		case stageReversing:
-			tr.reversalErr = "timeout: no reply within " + t.replyTimeout.String()
+		pending++
+		if !tr.retry {
+			continue
 		}
-		logger.WarningLog.Printf("txn %s: wallet %s timed out in stage %d", t.transactionID, tr.walletID, t.stage)
+		action, key := tr.action, tr.key
+		if t.stage == stageReversing {
+			if tr.reversalKey == nil {
+				continue
+			}
+			action, key = tr.action.Opposite(), *tr.reversalKey
+		}
+		tr.retry = !t.send(ctx, tr, action, key)
 	}
-	t.advance(ctx)
+	return pending
+}
+
+// ownRow scopes a query to this transaction's row. createdAt is its created_at
+// less a minute, so the window covers one partition (two at a month boundary).
+func (t *TransactionActor) ownRow(db *gorm.DB) *gorm.DB {
+	return db.Where("id = ? AND created_at >= ? AND created_at < ?", t.transactionID, t.createdAt, t.createdAt.Add(2*time.Minute))
+}
+
+func (t *TransactionActor) heartbeat() {
+	err := t.db.Model(&models.Transaction{}).
+		Scopes(t.ownRow).Where("is_completed = FALSE").
+		Update("updated_at", time.Now()).Error
+	if err != nil {
+		logger.WarningLog.Printf("txn %s: heartbeat: %v", t.transactionID, err)
+	}
 }
 
 // armTimeout schedules a TransactionTimeoutMsg for the current stage.
@@ -428,14 +558,16 @@ func (t *TransactionActor) advance(ctx actor.Context) {
 		return
 	}
 	switch t.stage {
-	case stageProcessing:
-		if t.anyFailed() {
+	case stageProcessing, stageCrediting:
+		switch {
+		case t.anyFailed():
 			t.fireReversals(ctx)
-			// Every leg may already be done (nothing applied, or no PIDs).
-			if t.allDone() {
-				ctx.Send(ctx.Self(), &pb.FinalizeTransactionMsg{TransactionId: t.transactionID.String()})
-			}
-		} else {
+		case t.stage == stageProcessing:
+			t.fireCredits(ctx)
+		}
+		// The next stage may have nothing in flight (nothing to undo, or
+		// every credit already applied).
+		if t.allDone() {
 			ctx.Send(ctx.Self(), &pb.FinalizeTransactionMsg{TransactionId: t.transactionID.String()})
 		}
 	case stageReversing:
@@ -443,9 +575,10 @@ func (t *TransactionActor) advance(ctx actor.Context) {
 	}
 }
 
+// allDone reports whether every leg of the current stage has its answer.
 func (t *TransactionActor) allDone() bool {
 	for i := range t.transfers {
-		if !t.transfers[i].done {
+		if !t.transfers[i].done && t.inStage(&t.transfers[i]) {
 			return false
 		}
 	}
@@ -481,7 +614,7 @@ func (t *TransactionActor) persistPlan() {
 	raw, err := EncodePlan(plan)
 	if err == nil {
 		err = t.db.Model(&models.Transaction{}).
-			Where("id = ? AND created_at >= ?", t.transactionID, t.createdAt).
+			Scopes(t.ownRow).
 			Updates(map[string]any{"transfers": raw, "updated_at": time.Now()}).Error
 	}
 	if err != nil {
@@ -491,7 +624,7 @@ func (t *TransactionActor) persistPlan() {
 
 // finalize writes the terminal status exactly once, notifies, and stops.
 func (t *TransactionActor) finalize(ctx actor.Context) {
-	if t.stage == stageFinalized || t.stage == stageIdle {
+	if t.stage == stageFinalized || t.stage == stageIdle || !t.allDone() {
 		return
 	}
 	t.stage = stageFinalized
@@ -522,44 +655,120 @@ func (t *TransactionActor) finalize(ctx actor.Context) {
 		narration += " (reversal incomplete, reconciliation required)"
 	}
 
-	var err error
-	for attempt := 1; attempt <= finalizeAttempts; attempt++ {
-		now := time.Now()
-		err = t.db.Model(&models.Transaction{}).
-			Where("id = ? AND created_at >= ?", t.transactionID, t.createdAt).
-			Updates(map[string]any{
-				"status":         status,
-				"narration":      narration,
-				"date_completed": now,
-				"is_completed":   true,
-				"updated_at":     now,
-			}).Error
+	var (
+		err      error
+		row      models.Transaction
+		original *models.Transaction
+		written  bool
+		attempt  int
+	)
+	for attempt = 1; attempt <= finalizeAttempts; attempt++ {
+		row, original, written = models.Transaction{}, nil, false
+		err = t.db.Transaction(func(db *gorm.DB) error {
+			now := time.Now()
+			// One outcome per transaction; RETURNING * feeds the callback.
+			res := db.Model(&row).
+				Clauses(clause.Returning{}).
+				Scopes(t.ownRow).Where("is_completed = FALSE").
+				Updates(map[string]any{
+					"status":         status,
+					"narration":      narration,
+					"date_completed": now,
+					"is_completed":   true,
+					"updated_at":     now,
+				})
+			if res.Error != nil {
+				return res.Error
+			}
+			written = res.RowsAffected > 0
+			if written && status == models.TransactionStatusSuccess && row.Type == models.TransactionTypeReversal && row.ProviderRef != nil {
+				original, err = t.markReversed(db, *row.ProviderRef, now)
+				return err
+			}
+			return nil
+		})
 		if err == nil {
 			break
 		}
 		logger.WarningLog.Printf("txn %s: final status write attempt %d failed: %v", t.transactionID, attempt, err)
 		time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 	}
-	if err != nil {
+
+	switch {
+	case err != nil:
 		// The row stays in processing; the recovery sweeper will re-drive it,
 		// find every leg settled in the ledger, and finalize again.
 		logger.ErrorLog.Printf("txn %s: could not write final status %s, left for recovery: %v", t.transactionID, status, err)
-	} else {
+	case !written:
+		t.alreadyFinal(status, attempt > 1)
+	default:
 		logger.InfoLog.Printf("txn %s finalized: %s", t.transactionID, status)
-		t.notify()
+		if original != nil {
+			keys := []string{cache.TransactionKey(original.ID.String()), cache.TransactionRRNKey(original.RRN)}
+			if original.OrderID != nil {
+				keys = append(keys, cache.TransactionOrderKey(*original.OrderID))
+			}
+			cache.Delete(keys...)
+		}
+		t.notifier.Notify(row, t.movements(row.Currency))
 	}
 
 	ctx.Poison(ctx.Self())
 }
 
-func (t *TransactionActor) notify() {
-	var tx models.Transaction
-	err := t.db.Where("id = ? AND created_at >= ?", t.transactionID, t.createdAt).First(&tx).Error
-	if err != nil {
-		logger.ErrorLog.Printf("txn %s: could not load for notification: %v", t.transactionID, err)
-		return
+// alreadyFinal handles a finalize that found the row completed: by an earlier
+// attempt whose commit acknowledgement was lost, or by recovery. The outcome
+// already written stands.
+func (t *TransactionActor) alreadyFinal(status models.TransactionStatus, retried bool) {
+	var row models.Transaction
+	err := t.db.Scopes(t.ownRow).First(&row).Error
+	switch {
+	case err != nil:
+		logger.ErrorLog.Printf("txn %s: final status %s not written: %v", t.transactionID, status, err)
+	case row.Status != status:
+		logger.ErrorLog.Printf("txn %s: RECONCILIATION REQUIRED outcome %s not written, already completed as %s",
+			t.transactionID, status, row.Status)
+	case retried:
+		// An earlier attempt committed but its callback was never sent. For a
+		// reversal, the original's id key expires on its TTL.
+		if row.Type == models.TransactionTypeReversal && row.ProviderRef != nil {
+			keys := []string{cache.TransactionRRNKey(*row.ProviderRef)}
+			if row.OrderID != nil {
+				keys = append(keys, cache.TransactionOrderKey(*row.OrderID))
+			}
+			cache.Delete(keys...)
+		}
+		logger.InfoLog.Printf("txn %s finalized: %s", t.transactionID, status)
+		t.notifier.Notify(row, t.movements(row.Currency))
 	}
-	t.notifier.Notify(tx, t.movements(tx.Currency))
+}
+
+// markReversed flips the transaction a successful reversal undid (named by
+// RRN in the reversal's provider_ref) from success to reversed. It runs in
+// the same database transaction as the reversal's final status, so the two
+// cannot disagree. Finding nothing to flip means the original was already
+// reversed or changed underneath: money moved anyway, so it is flagged.
+func (t *TransactionActor) markReversed(db *gorm.DB, rrn string, now time.Time) (*models.Transaction, error) {
+	var original models.Transaction
+	res := db.Model(&original).
+		Clauses(clause.Returning{Columns: []clause.Column{{Name: "id"}, {Name: "rrn"}, {Name: "order_id"}}}).
+		// The original predates the reversal (t.createdAt is the reversal's
+		// creation less a minute), so future partitions are skipped too.
+		Where("rrn = ? AND status = ? AND created_at >= ? AND created_at < ?", rrn, models.TransactionStatusSuccess,
+			t.createdAt.Add(-reversalLookback), t.createdAt.Add(time.Minute)).
+		Updates(map[string]any{
+			"status":     models.TransactionStatusReversed,
+			"narration":  "Transaction reversed",
+			"updated_at": now,
+		})
+	if res.Error != nil {
+		return nil, res.Error
+	}
+	if res.RowsAffected == 0 {
+		logger.ErrorLog.Printf("txn %s: RECONCILIATION REQUIRED reversal settled but original rrn %s was not in success", t.transactionID, rrn)
+		return nil, nil
+	}
+	return &original, nil
 }
 
 // movements folds the balances observed in wallet replies into one entry per

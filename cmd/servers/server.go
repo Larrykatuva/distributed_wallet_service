@@ -27,6 +27,11 @@ func Run(cfg *config.Config, gdb *gorm.DB) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.TransactionTimeout*2 > cfg.RecoveryStaleAfter {
+		logger.WarningLog.Printf("TRANSACTION_TIMEOUT (%s) should be at most half of RECOVERY_STALE_AFTER (%s), or the sweeper may re-drive live transactions",
+			cfg.TransactionTimeout, cfg.RecoveryStaleAfter)
+	}
+
 	notifier := webhook.NewNotifier(services.TransactionPayload(gdb))
 
 	c, err := cluster.New(cfg, cluster.Kinds(gdb, notifier, cfg.TransactionTimeout))

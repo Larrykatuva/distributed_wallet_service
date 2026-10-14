@@ -33,6 +33,36 @@ func Get(key string, dest any) (found bool) {
 	return true
 }
 
+// GetMany loads keys in one round trip. found[i] reports whether vals[i] was
+// loaded; errors count as misses.
+func GetMany[T any](keys []string) (vals []T, found []bool) {
+	vals, found = make([]T, len(keys)), make([]bool, len(keys))
+	c := Default
+	if !c.Enabled() || len(keys) == 0 {
+		return vals, found
+	}
+	ctx, cancel := c.ctx()
+	defer cancel()
+
+	raw, err := c.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		logger.WarningLog.Printf("cache: mget %d keys: %v", len(keys), err)
+		return vals, found
+	}
+	for i, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+		if err = json.Unmarshal([]byte(s), &vals[i]); err != nil {
+			logger.WarningLog.Printf("cache: decode %s: %v", keys[i], err)
+			continue
+		}
+		found[i] = true
+	}
+	return vals, found
+}
+
 // Set stores v under key. ttl <= 0 uses the default TTL.
 func Set(key string, v any, ttl time.Duration) {
 	c := Default
