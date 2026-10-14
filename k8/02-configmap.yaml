@@ -26,6 +26,8 @@ data:
   DB_NAME: "wallet_database"
   DB_USER: "postgres"
   DB_SSLMODE: "disable"
+  DB_MAX_OPEN_CONNS: "50"
+  DB_MAX_IDLE_CONNS: "50"
   USE_PGBOUNCER: "true"
   PGBOUNCER_HOST: "wallet-pgbouncer.wallet.svc.cluster.local"
   PGBOUNCER_PORT: "6432"

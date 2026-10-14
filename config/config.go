@@ -55,6 +55,10 @@ type Config struct {
 	DbName     string
 	DbPort     string
 	DbSSLMode  string
+
+	// Application connection pool (per process).
+	DbMaxOpenConns int
+	DbMaxIdleConns int
 }
 
 // Load reads .env (if present) and then the process environment.
@@ -98,6 +102,9 @@ func Load() *Config {
 		DbName:     getEnv("DB_NAME", "wallet_database"),
 		DbPort:     getEnv("DB_PORT", "5432"),
 		DbSSLMode:  getEnv("DB_SSLMODE", "disable"),
+
+		DbMaxOpenConns: getEnvInt("DB_MAX_OPEN_CONNS", 50),
+		DbMaxIdleConns: getEnvInt("DB_MAX_IDLE_CONNS", getEnvInt("DB_MAX_OPEN_CONNS", 50)),
 	}
 }
 

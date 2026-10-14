@@ -51,7 +51,7 @@ func walletBalances(db *gorm.DB, tx models.Transaction) []types.WalletBalanceDto
 	var rows []models.Ledger
 	err := db.
 		Select("id", "wallet_id", "currency", "initial_balance", "updated_balance").
-		Where("transaction_id = ? AND created_at >= ?", tx.ID, tx.CreatedAt.Add(-time.Minute)).
+		Where("transaction_id = ? AND created_at >= ? AND created_at < ?", tx.ID, tx.CreatedAt.Add(-time.Minute), notAfter()).
 		Order("id ASC").
 		Find(&rows).Error
 	if err != nil {

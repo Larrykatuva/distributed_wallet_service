@@ -24,6 +24,7 @@ const (
 	TransactionStatusProcessing TransactionStatus = "processing"
 	TransactionStatusSuccess    TransactionStatus = "success"
 	TransactionStatusFailed     TransactionStatus = "failed"
+	TransactionStatusReversed   TransactionStatus = "reversed" // a successful reversal undid it
 )
 
 // Transaction records a financial event. Amounts are int64 minor units.

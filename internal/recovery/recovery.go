@@ -100,7 +100,7 @@ func (m *Manager) Recover(txID uuid.UUID, reason string) {
 
 func (m *Manager) recover(txID uuid.UUID, reason string, attempt int) error {
 	var tx models.Transaction
-	err := m.db.Where("id = ? AND created_at >= ?", txID, time.Now().Add(-m.opts.Lookback)).First(&tx).Error
+	err := m.db.Where("id = ? AND created_at >= ? AND created_at < ?", txID, time.Now().Add(-m.opts.Lookback), notAfter()).First(&tx).Error
 	if err != nil {
 		return fmt.Errorf("load: %w", err)
 	}
@@ -142,7 +142,7 @@ func (m *Manager) recover(txID uuid.UUID, reason string, attempt int) error {
 func (m *Manager) giveUp(tx models.Transaction, reason string) error {
 	var moved int64
 	m.db.Model(&models.Ledger{}).
-		Where("transaction_id = ? AND created_at >= ?", tx.ID, tx.CreatedAt.Add(-time.Minute)).
+		Where("transaction_id = ? AND created_at >= ? AND created_at < ?", tx.ID, tx.CreatedAt.Add(-time.Minute), notAfter()).
 		Count(&moved)
 	msg := fmt.Sprintf("processing abandoned after %d recovery attempts (%s)", m.opts.MaxAttempts, reason)
 	return m.markFailed(tx, msg, moved > 0)
@@ -155,7 +155,8 @@ func (m *Manager) markFailed(tx models.Transaction, narration string, reconcile 
 	}
 	now := time.Now()
 	err := m.db.Model(&models.Transaction{}).
-		Where("id = ? AND created_at >= ? AND is_completed = FALSE", tx.ID, tx.CreatedAt.Add(-time.Minute)).
+		Where("id = ? AND created_at >= ? AND created_at < ? AND is_completed = FALSE",
+			tx.ID, tx.CreatedAt.Add(-time.Minute), tx.CreatedAt.Add(time.Minute)).
 		Updates(map[string]any{
 			"status": models.TransactionStatusFailed, "narration": narration,
 			"is_completed": true, "date_completed": now, "updated_at": now,
@@ -169,6 +170,10 @@ func (m *Manager) markFailed(tx models.Transaction, narration string, reconcile 
 	m.notifier.Notify(tx, nil)
 	return nil
 }
+
+// notAfter bounds rows that cannot be dated in the future, pruning the
+// months created ahead of time.
+func notAfter() time.Time { return time.Now().Add(24 * time.Hour) }
 
 func (m *Manager) forget(txID uuid.UUID) {
 	m.mu.Lock()
@@ -198,8 +203,8 @@ func (m *Manager) RunSweeper(ctx context.Context) {
 func (m *Manager) sweep() {
 	var stuck []uuid.UUID
 	err := m.db.Model(&models.Transaction{}).
-		Where("is_completed = FALSE AND updated_at < ? AND created_at >= ?",
-			time.Now().Add(-m.opts.StaleAfter), time.Now().Add(-m.opts.Lookback)).
+		Where("is_completed = FALSE AND updated_at < ? AND created_at >= ? AND created_at < ?",
+			time.Now().Add(-m.opts.StaleAfter), time.Now().Add(-m.opts.Lookback), notAfter()).
 		Limit(200).
 		Pluck("id", &stuck).Error
 	if err != nil {

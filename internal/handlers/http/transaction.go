@@ -34,7 +34,23 @@ func (h *TransactionHandler) Initiate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, result)
 }
 
-// List: GET /transaction?merchant_id=&profile_id=&wallet_id=&status=&type=&order_id=&provider_ref=&from=&to=&page=&page_size=
+// Reverse POST /transaction/reverse undoes a successful transaction by RRN.
+// Like Initiate it returns 202: the reversal settles asynchronously.
+func (h *TransactionHandler) Reverse(w http.ResponseWriter, r *http.Request) {
+	var payload types.TransactionReverseReqDto
+	if !decode(w, r, &payload) {
+		return
+	}
+
+	result, err := h.transactions.Reverse(payload)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, result)
+}
+
+// List GET /transaction?merchant_id=&profile_id=&wallet_id=&status=&type=&order_id=&provider_ref=&from=&to=&page=&page_size=
 func (h *TransactionHandler) List(w http.ResponseWriter, r *http.Request) {
 	fe := validation.FieldErrors{}
 	f := types.TransactionFilter{
@@ -49,10 +65,10 @@ func (h *TransactionHandler) List(w http.ResponseWriter, r *http.Request) {
 	if st := queryString(r, "status"); st != nil {
 		s := models.TransactionStatus(*st)
 		switch s {
-		case models.TransactionStatusPending, models.TransactionStatusProcessing, models.TransactionStatusSuccess, models.TransactionStatusFailed:
+		case models.TransactionStatusPending, models.TransactionStatusProcessing, models.TransactionStatusSuccess, models.TransactionStatusFailed, models.TransactionStatusReversed:
 			f.Status = &s
 		default:
-			fe["status"] = "must be one of: pending, processing, success, failed"
+			fe["status"] = "must be one of: pending, processing, success, failed, reversed"
 		}
 	}
 	if tp := queryString(r, "type"); tp != nil {
@@ -78,7 +94,7 @@ func (h *TransactionHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, map[string]string{"id": "is not a valid UUID"})
 		return
 	}
-	result, err := h.transactions.GetByID(id)
+	result, err := h.transactions.GetByID(id, r.URL.Query().Get("date"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -87,7 +103,7 @@ func (h *TransactionHandler) GetByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *TransactionHandler) GetByRRN(w http.ResponseWriter, r *http.Request) {
-	result, err := h.transactions.GetByRRN(chi.URLParam(r, "rrn"))
+	result, err := h.transactions.GetByRRN(chi.URLParam(r, "rrn"), r.URL.Query().Get("date"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -96,7 +112,7 @@ func (h *TransactionHandler) GetByRRN(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *TransactionHandler) GetByOrderID(w http.ResponseWriter, r *http.Request) {
-	result, err := h.transactions.GetByOrderID(chi.URLParam(r, "orderId"))
+	result, err := h.transactions.GetByOrderID(chi.URLParam(r, "orderId"), r.URL.Query().Get("date"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -104,9 +120,9 @@ func (h *TransactionHandler) GetByOrderID(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, result)
 }
 
-// ResendCallback: POST /transaction/rrn/{rrn}/resend-callback
+// ResendCallback POST /transaction/rrn/{rrn}/resend-callback?date=YYYY-MM-DD
 func (h *TransactionHandler) ResendCallback(w http.ResponseWriter, r *http.Request) {
-	if err := h.transactions.ResendCallback(chi.URLParam(r, "rrn")); err != nil {
+	if err := h.transactions.ResendCallback(chi.URLParam(r, "rrn"), r.URL.Query().Get("date")); err != nil {
 		writeServiceError(w, err)
 		return
 	}

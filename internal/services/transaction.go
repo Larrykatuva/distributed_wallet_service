@@ -9,6 +9,7 @@ import (
 
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/katuva/wallet/dpk/cache"
 	"github.com/katuva/wallet/dpk/utils"
 	"github.com/katuva/wallet/internal/actors"
@@ -19,17 +20,9 @@ import (
 	"gorm.io/gorm"
 )
 
-// Cache TTLs. Completed transactions are immutable, so their rendered
-// payload is cached; pending ones never are. order-used markers guard replays
-// without a database round trip.
-const (
-	completedTxnTTL = 15 * time.Minute
-	orderUsedTTL    = 48 * time.Hour
-)
-
-// lookbackWindow bounds created_at in point lookups so Postgres can prune
-// partitions instead of scanning every month.
-const lookbackWindow = 400 * 24 * time.Hour
+// completedTxnTTL: completed transactions are immutable, so their rendered
+// payload is cached; pending ones never are.
+const completedTxnTTL = 15 * time.Minute
 
 type TransactionService struct {
 	db       *gorm.DB
@@ -185,25 +178,17 @@ func (ts *TransactionService) Initiate(payload types.TransactionReqDto) (types.T
 		return types.TransactionResDto{}, err
 	}
 
-	// order_id is the caller's idempotency handle: refuse a replay rather
-	// than moving money twice. (Partitioning prevents a plain UNIQUE index.)
-	// The cache marker answers the common case; the database is the authority.
-	if cache.Exists(cache.OrderUsedKey(payload.OrderId)) {
-		if existing, err := ts.findByOrderID(payload.OrderId); err == nil && existing != nil {
-			return types.TransactionFromModel(*existing), conflict("order_id already used")
-		}
-	}
-	if existing, err := ts.findByOrderID(payload.OrderId); err != nil {
-		return types.TransactionResDto{}, err
-	} else if existing != nil {
-		return types.TransactionFromModel(*existing), conflict("order_id already used")
-	}
+	return ts.dispatch(ts.buildTransaction(payload, plan, wallets), plan.Legs)
+}
 
-	transaction := ts.buildTransaction(payload, plan, wallets)
+// dispatch persists a validated transaction as pending with its plan and
+// hands it to a TransactionActor.
+func (ts *TransactionService) dispatch(transaction models.Transaction, legs []actors.PlanEntry) (types.TransactionResDto, error) {
+	var err error
 
 	// The plan (legs + idempotency keys) is stored with the row so a lost
 	// orchestrator can be recovered from the ledger.
-	if transaction.Transfers, err = actors.EncodePlan(plan.Legs); err != nil {
+	if transaction.Transfers, err = actors.EncodePlan(legs); err != nil {
 		return types.TransactionResDto{}, err
 	}
 
@@ -214,18 +199,216 @@ func (ts *TransactionService) Initiate(payload types.TransactionReqDto) (types.T
 		return types.TransactionResDto{}, unavailable("transaction processor unavailable")
 	}
 
-	if err = ts.db.Create(&transaction).Error; err != nil {
+	if err = ts.create(&transaction); err != nil {
 		return types.TransactionResDto{}, fmt.Errorf("create transaction: %w", err)
 	}
-	cache.Set(cache.OrderUsedKey(payload.OrderId), true, orderUsedTTL)
 
 	ts.cluster.ActorSystem.Root.Send(txnPID, &pb.StartTransactionMsg{
 		TransactionId: transaction.ID.String(),
 		CreatedAtUnix: transaction.CreatedAt.Add(-time.Minute).Unix(),
-		Transfers:     actors.PlanToProto(plan.Legs),
+		Transfers:     actors.PlanToProto(legs),
 	})
 
 	return types.TransactionFromModel(transaction), nil
+}
+
+// create inserts the transaction, drawing a new RRN if the one it has collides.
+func (ts *TransactionService) create(transaction *models.Transaction) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = ts.db.Create(transaction).Error; err == nil || !isRRNConflict(err) {
+			return err
+		}
+		transaction.RRN = utils.GenerateRrn()
+	}
+	return err
+}
+
+func isRRNConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && strings.Contains(pgErr.ConstraintName, "rrn")
+}
+
+// Reverse undoes a successful transaction. The reversal is a new transaction
+// of type reversal whose legs are the original's ledger rows with debit and
+// credit swapped; it runs through the TransactionActor like any other, and on
+// success the actor marks the original reversed. The reversal carries the
+// original's order_id, and its provider_ref is the original RRN.
+//
+// Rules:
+//   - only a successful, non-reversal transaction can be reversed;
+//   - one live reversal per transaction (a failed one may be retried);
+//   - the ledger must match the persisted plan exactly, leg for leg;
+//   - every wallet is still active and holds the available balance its
+//     reversal debits need, so the reversal does not fail half way.
+func (ts *TransactionService) Reverse(payload types.TransactionReverseReqDto) (types.TransactionResDto, error) {
+	from, to, err := dayWindow("transaction_date", payload.TransactionDate)
+	if err != nil {
+		return types.TransactionResDto{}, err
+	}
+
+	var orig models.Transaction
+	err = ts.db.Where("rrn = ? AND created_at >= ? AND created_at < ?", payload.RRN, from, to).First(&orig).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return types.TransactionResDto{}, notFound("transaction not found on " + payload.TransactionDate)
+	}
+	if err != nil {
+		return types.TransactionResDto{}, fmt.Errorf("get transaction: %w", err)
+	}
+
+	if orig.Status != models.TransactionStatusSuccess {
+		return types.TransactionResDto{}, invalid(fmt.Sprintf("only successful transactions can be reversed; this one is %s", orig.Status))
+	}
+	if orig.Type == models.TransactionTypeReversal {
+		return types.TransactionResDto{}, invalid("a reversal cannot itself be reversed")
+	}
+	if orig.MerchantID == nil || orig.OrderID == nil {
+		return types.TransactionResDto{}, invalid("transaction has no merchant or order_id; cannot reverse")
+	}
+	cur, ok := currency.Lookup(orig.Currency)
+	if !ok {
+		return types.TransactionResDto{}, invalid(fmt.Sprintf("transaction currency %q is not supported", orig.Currency))
+	}
+
+	// A reversal names its original by RRN in provider_ref and is always
+	// created after it, so the replay check skips every older partition.
+	var existing models.Transaction
+	err = ts.db.Where("provider_ref = ? AND type = ? AND created_at >= ? AND created_at < ?",
+		orig.RRN, models.TransactionTypeReversal, orig.CreatedAt, notAfter()).
+		Order("created_at DESC").Limit(1).Find(&existing).Error
+	if err != nil {
+		return types.TransactionResDto{}, fmt.Errorf("find reversal: %w", err)
+	}
+	if existing.ID != uuid.Nil && existing.Status != models.TransactionStatusFailed {
+		return types.TransactionFromModel(existing), conflict(fmt.Sprintf("transaction already has a reversal (rrn %s, %s)", existing.RRN, existing.Status))
+	}
+
+	legs, err := ts.reversalLegs(orig)
+	if err != nil {
+		return types.TransactionResDto{}, err
+	}
+
+	ids := make([]uuid.UUID, 0, len(legs))
+	for _, l := range legs {
+		ids = append(ids, l.WalletID)
+	}
+	wallets, err := ts.wallets.ValidateWallets(ids)
+	if err != nil {
+		return types.TransactionResDto{}, err
+	}
+	if err = ts.ensureReversalFunds(legs, cur); err != nil {
+		return types.TransactionResDto{}, err
+	}
+
+	purpose := "reversal of " + orig.RRN
+	callbackURL := ""
+	if orig.CallbackURL != nil {
+		callbackURL = *orig.CallbackURL
+	}
+	if payload.CallbackUrl != nil && *payload.CallbackUrl != "" {
+		callbackURL = *payload.CallbackUrl
+	}
+	entries := make([]types.TransactionEntryDto, 0, len(legs))
+	for _, l := range legs {
+		entries = append(entries, types.TransactionEntryDto{WalletID: l.WalletID, Action: l.Action,
+			Amount: types.MoneyFromMinor(l.Amount, cur.Exponent), Purpose: l.Purpose, IsFee: l.IsFee, IsInitial: l.IsInitial})
+	}
+	req := types.TransactionReqDto{
+		Type:        models.TransactionTypeReversal,
+		MerchantID:  *orig.MerchantID,
+		OrderId:     *orig.OrderID,
+		ProviderRef: orig.RRN,
+		CallbackUrl: callbackURL,
+		Purpose:     &purpose,
+		Description: payload.Description,
+		Transfers:   entries,
+	}
+
+	transaction := ts.buildTransaction(req, Plan{Currency: cur, TotalAmount: orig.Amount, Fee: orig.Fee, Legs: legs}, wallets)
+	transaction.Narration = "Reversal accepted for processing"
+	return ts.dispatch(transaction, legs)
+}
+
+// reversalLegs inverts the original's ledger rows; each reversal leg keeps
+// the row's purpose, prefixed "Reversal: ", so its ledger entry reads as the
+// undo of that specific movement. Each row must match a
+// planned leg by idempotency key (wallet, action and amount included), and
+// every leg must have exactly one row: anything else means the transaction
+// needs reconciliation, not an automatic reversal.
+func (ts *TransactionService) reversalLegs(orig models.Transaction) ([]actors.PlanEntry, error) {
+	plan, err := actors.DecodePlan(orig.Transfers)
+	if err != nil {
+		return nil, err
+	}
+	var rows []models.Ledger
+	err = ts.db.Where("transaction_id = ? AND created_at >= ? AND created_at < ?", orig.ID, orig.CreatedAt.Add(-time.Minute), notAfter()).
+		Order("id ASC").Find(&rows).Error
+	if err != nil {
+		return nil, fmt.Errorf("load ledger: %w", err)
+	}
+
+	mismatch := invalid("transaction ledger does not match its transfers; reconcile it before reversing")
+	if len(rows) == 0 || len(rows) != len(plan) {
+		return nil, mismatch
+	}
+	byKey := make(map[uuid.UUID]actors.PlanEntry, len(plan))
+	for _, l := range plan {
+		byKey[l.IdempotencyKey] = l
+	}
+
+	legs := make([]actors.PlanEntry, 0, len(rows))
+	for _, r := range rows {
+		if r.IdempotencyKey == nil {
+			return nil, mismatch
+		}
+		leg, ok := byKey[*r.IdempotencyKey]
+		if !ok || leg.WalletID != r.WalletID || leg.Action != r.Type || leg.Amount != r.Amount {
+			return nil, mismatch
+		}
+		delete(byKey, *r.IdempotencyKey)
+
+		legs = append(legs, actors.PlanEntry{
+			WalletID: r.WalletID, Action: r.Type.Opposite(), Amount: r.Amount, Purpose: "Reversal: " + r.Purpose,
+			IsFee: leg.IsFee, IsInitial: leg.IsInitial, IdempotencyKey: uuid.New(),
+		})
+	}
+	return legs, nil
+}
+
+// ensureReversalFunds checks, before anything moves, that each wallet's
+// available balance covers the sum of its reversal debits. Credits are not
+// netted: every debit runs before any credit. Balances
+// are read fresh from the database, never from cache. The WalletActor still
+// enforces this per leg; the check only keeps a doomed reversal from starting.
+func (ts *TransactionService) ensureReversalFunds(legs []actors.PlanEntry, cur currency.Currency) error {
+	need := map[uuid.UUID]int64{}
+	for _, l := range legs {
+		if l.Action == models.LedgerTypeDebit {
+			need[l.WalletID] += l.Amount
+		}
+	}
+	if len(need) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(need))
+	for id := range need {
+		ids = append(ids, id)
+	}
+
+	var wallets []models.Wallet
+	if err := ts.db.Select("id", "number", "available_balance").Where("id IN ?", ids).Find(&wallets).Error; err != nil {
+		return fmt.Errorf("load wallet balances: %w", err)
+	}
+	if len(wallets) != len(ids) {
+		return notFound("a wallet in the transaction no longer exists")
+	}
+	for _, wl := range wallets {
+		if wl.AvailableBalance < need[wl.ID] {
+			return invalid(fmt.Sprintf("wallet %s has insufficient available balance to reverse: needs %s, has %s", wl.Number,
+				types.MoneyFromMinor(need[wl.ID], cur.Exponent), types.MoneyFromMinor(wl.AvailableBalance, cur.Exponent)))
+		}
+	}
+	return nil
 }
 
 func (ts *TransactionService) buildTransaction(payload types.TransactionReqDto, plan Plan, wallets map[uuid.UUID]models.Wallet) models.Transaction {
@@ -275,11 +458,41 @@ func (ts *TransactionService) buildTransaction(payload types.TransactionReqDto, 
 	return transaction
 }
 
-// GetByRRN looks a transaction up by its retrieval reference number.
-func (ts *TransactionService) GetByRRN(rrn string) (types.TransactionResDto, error) {
-	return ts.detail(cache.TransactionRRNKey(rrn), func() (*models.Transaction, error) {
+// dayWindow bounds created_at to the caller's date, padded a day each side
+// for time zones, so Postgres reads one monthly partition (two at a boundary).
+func dayWindow(field, date string) (from, to time.Time, err error) {
+	day, err := time.Parse("2006-01-02", date)
+	if err != nil {
+		return from, to, invalid(field + " must be YYYY-MM-DD")
+	}
+	return day.AddDate(0, 0, -1), day.AddDate(0, 0, 2), nil
+}
+
+// notAfter bounds rows that cannot be dated in the future, pruning the
+// months created ahead of time.
+func notAfter() time.Time { return time.Now().Add(24 * time.Hour) }
+
+// GetByRRN looks a transaction up by its retrieval reference number and
+// creation date (YYYY-MM-DD).
+func (ts *TransactionService) GetByRRN(rrn, date string) (types.TransactionResDto, error) {
+	from, to, err := dayWindow("date", date)
+	if err != nil {
+		return types.TransactionResDto{}, err
+	}
+	return ts.detail(cache.TransactionRRNKey(rrn), from, to, func() (*models.Transaction, error) {
+		return ts.findByRRN(rrn, from, to)
+	})
+}
+
+// GetByID looks a transaction up by its UUID and creation date (YYYY-MM-DD).
+func (ts *TransactionService) GetByID(id uuid.UUID, date string) (types.TransactionResDto, error) {
+	from, to, err := dayWindow("date", date)
+	if err != nil {
+		return types.TransactionResDto{}, err
+	}
+	return ts.detail(cache.TransactionKey(id.String()), from, to, func() (*models.Transaction, error) {
 		var tx models.Transaction
-		err := ts.db.Where("rrn = ? AND created_at >= ?", rrn, time.Now().Add(-lookbackWindow)).First(&tx).Error
+		err := ts.db.Where("id = ? AND created_at >= ? AND created_at < ?", id, from, to).First(&tx).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, notFound("transaction not found")
 		}
@@ -290,17 +503,13 @@ func (ts *TransactionService) GetByRRN(rrn string) (types.TransactionResDto, err
 	})
 }
 
-// GetByID looks a transaction up by its UUID.
-func (ts *TransactionService) GetByID(id uuid.UUID) (types.TransactionResDto, error) {
-	return ts.detail(cache.TransactionKey(id.String()), func() (*models.Transaction, error) { return ts.findByID(id) })
-}
-
 // detail renders a single transaction with transfers and balances. Completed
 // transactions are immutable, so the rendered payload is cached under every
-// lookup key; pending ones are always read fresh.
-func (ts *TransactionService) detail(key string, load func() (*models.Transaction, error)) (types.TransactionResDto, error) {
+// lookup key; pending ones are always read fresh. A cached copy is only used
+// inside the requested date window, so a wrong date is not found either way.
+func (ts *TransactionService) detail(key string, from, to time.Time, load func() (*models.Transaction, error)) (types.TransactionResDto, error) {
 	var cached types.TransactionResDto
-	if cache.Get(key, &cached) {
+	if cache.Get(key, &cached) && !cached.CreatedAt.Before(from) && cached.CreatedAt.Before(to) {
 		return cached, nil
 	}
 	tx, err := load()
@@ -311,16 +520,17 @@ func (ts *TransactionService) detail(key string, load func() (*models.Transactio
 	if tx.IsCompleted {
 		cache.Set(cache.TransactionKey(tx.ID.String()), dto, completedTxnTTL)
 		cache.Set(cache.TransactionRRNKey(tx.RRN), dto, completedTxnTTL)
-		if tx.OrderID != nil {
+		// A reversal shares its original's order_id; that key stays the original's.
+		if tx.OrderID != nil && tx.Type != models.TransactionTypeReversal {
 			cache.Set(cache.TransactionOrderKey(*tx.OrderID), dto, completedTxnTTL)
 		}
 	}
 	return dto, nil
 }
 
-func (ts *TransactionService) findByID(id uuid.UUID) (*models.Transaction, error) {
+func (ts *TransactionService) findByRRN(rrn string, from, to time.Time) (*models.Transaction, error) {
 	var tx models.Transaction
-	err := ts.db.Where("id = ? AND created_at >= ?", id, time.Now().Add(-lookbackWindow)).First(&tx).Error
+	err := ts.db.Where("rrn = ? AND created_at >= ? AND created_at < ?", rrn, from, to).First(&tx).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, notFound("transaction not found")
 	}
@@ -331,15 +541,15 @@ func (ts *TransactionService) findByID(id uuid.UUID) (*models.Transaction, error
 }
 
 // ResendCallback re-delivers the completion webhook for a finished
-// transaction. Balances are rebuilt from the ledger.
-func (ts *TransactionService) ResendCallback(rrn string) error {
-	var tx models.Transaction
-	err := ts.db.Where("rrn = ? AND created_at >= ?", rrn, time.Now().Add(-lookbackWindow)).First(&tx).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return notFound("transaction not found")
-	}
+// transaction, found by RRN and creation date. Balances are rebuilt from the ledger.
+func (ts *TransactionService) ResendCallback(rrn, date string) error {
+	from, to, err := dayWindow("date", date)
 	if err != nil {
-		return fmt.Errorf("get transaction: %w", err)
+		return err
+	}
+	tx, err := ts.findByRRN(rrn, from, to)
+	if err != nil {
+		return err
 	}
 	if !tx.IsCompleted {
 		return invalid("transaction is still processing; callback is sent on completion")
@@ -347,7 +557,7 @@ func (ts *TransactionService) ResendCallback(rrn string) error {
 	if tx.CallbackURL == nil || *tx.CallbackURL == "" {
 		return invalid("transaction has no callback_url")
 	}
-	ts.notifier.Notify(tx, nil)
+	ts.notifier.Notify(*tx, nil)
 	return nil
 }
 
@@ -404,10 +614,15 @@ func (ts *TransactionService) List(f types.TransactionFilter, page types.Paginat
 	return types.NewPage(out, page, total), nil
 }
 
-// GetByOrderID looks a transaction up by the caller's order reference.
-func (ts *TransactionService) GetByOrderID(orderID string) (types.TransactionResDto, error) {
-	return ts.detail(cache.TransactionOrderKey(orderID), func() (*models.Transaction, error) {
-		tx, err := ts.findByOrderID(orderID)
+// GetByOrderID looks a transaction up by the caller's order reference and
+// creation date (YYYY-MM-DD).
+func (ts *TransactionService) GetByOrderID(orderID, date string) (types.TransactionResDto, error) {
+	from, to, err := dayWindow("date", date)
+	if err != nil {
+		return types.TransactionResDto{}, err
+	}
+	return ts.detail(cache.TransactionOrderKey(orderID), from, to, func() (*models.Transaction, error) {
+		tx, err := ts.findByOrderID(orderID, from, to)
 		if err != nil {
 			return nil, err
 		}
@@ -418,9 +633,10 @@ func (ts *TransactionService) GetByOrderID(orderID string) (types.TransactionRes
 	})
 }
 
-func (ts *TransactionService) findByOrderID(orderID string) (*models.Transaction, error) {
+func (ts *TransactionService) findByOrderID(orderID string, from, to time.Time) (*models.Transaction, error) {
 	var tx models.Transaction
-	err := ts.db.Where("order_id = ? AND created_at >= ?", orderID, time.Now().Add(-lookbackWindow)).
+	// Reversals reuse their original's order_id; the order belongs to the original.
+	err := ts.db.Where("order_id = ? AND type <> ? AND created_at >= ? AND created_at < ?", orderID, models.TransactionTypeReversal, from, to).
 		Order("created_at DESC").First(&tx).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil

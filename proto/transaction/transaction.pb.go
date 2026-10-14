@@ -229,11 +229,13 @@ func (x *InitiateTransactionRequest) GetTransfers() []*TransactionEntryDto {
 	return nil
 }
 
-// Exactly one of rrn or order_id must be set.
+// Exactly one of rrn or order_id must be set; date is the transaction's
+// creation date (YYYY-MM-DD).
 type GetTransactionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Rrn           *string                `protobuf:"bytes,1,opt,name=rrn,proto3,oneof" json:"rrn,omitempty"`
 	OrderId       *string                `protobuf:"bytes,2,opt,name=order_id,json=orderId,proto3,oneof" json:"order_id,omitempty"`
+	Date          string                 `protobuf:"bytes,3,opt,name=date,proto3" json:"date,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -278,6 +280,13 @@ func (x *GetTransactionRequest) GetRrn() string {
 func (x *GetTransactionRequest) GetOrderId() string {
 	if x != nil && x.OrderId != nil {
 		return *x.OrderId
+	}
+	return ""
+}
+
+func (x *GetTransactionRequest) GetDate() string {
+	if x != nil {
+		return x.Date
 	}
 	return ""
 }
@@ -559,10 +568,11 @@ const file_transaction_transaction_proto_rawDesc = "" +
 	" \x03(\v2 .transaction.TransactionEntryDtoR\ttransfersB\n" +
 	"\n" +
 	"\b_purposeB\x0e\n" +
-	"\f_description\"c\n" +
+	"\f_description\"w\n" +
 	"\x15GetTransactionRequest\x12\x15\n" +
 	"\x03rrn\x18\x01 \x01(\tH\x00R\x03rrn\x88\x01\x01\x12\x1e\n" +
-	"\border_id\x18\x02 \x01(\tH\x01R\aorderId\x88\x01\x01B\x06\n" +
+	"\border_id\x18\x02 \x01(\tH\x01R\aorderId\x88\x01\x01\x12\x12\n" +
+	"\x04date\x18\x03 \x01(\tR\x04dateB\x06\n" +
 	"\x04_rrnB\v\n" +
 	"\t_order_id\"\xb7\x01\n" +
 	"\x10WalletBalanceDto\x12\x1b\n" +

@@ -36,12 +36,16 @@ const (
 // selectProfileName keeps association loads to the two columns the DTO uses.
 func selectProfileName(db *gorm.DB) *gorm.DB { return db.Select("id", "full_name") }
 
+// withOwners joins the profile and merchant names in the same query.
+func (w *WalletService) withOwners(q *gorm.DB) *gorm.DB {
+	return q.Joins("Profile", w.db.Select("id", "full_name")).Joins("Merchant", w.db.Select("id", "full_name"))
+}
+
 // Get returns a wallet with its profile and merchant loaded.
 func (w *WalletService) Get(id uuid.UUID) (types.WalletResDto, error) {
 	return cache.Remember(cache.WalletKey(id.String()), walletReadTTL, func() (types.WalletResDto, error) {
 		var wallet models.Wallet
-		err := w.db.Preload("Profile", selectProfileName).Preload("Merchant", selectProfileName).
-			First(&wallet, "id = ?", id).Error
+		err := w.withOwners(w.db).First(&wallet, "wallets.id = ?", id).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return types.WalletResDto{}, notFound("wallet not found")
 		}
@@ -57,8 +61,7 @@ func (w *WalletService) GetByNumber(number string) (types.WalletResDto, error) {
 	number = strings.ToUpper(strings.TrimSpace(number))
 	return cache.Remember(cache.WalletNumberKey(number), walletReadTTL, func() (types.WalletResDto, error) {
 		var wallet models.Wallet
-		err := w.db.Preload("Profile", selectProfileName).Preload("Merchant", selectProfileName).
-			First(&wallet, "number = ?", number).Error
+		err := w.withOwners(w.db).First(&wallet, "wallets.number = ?", number).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return types.WalletResDto{}, notFound("wallet not found")
 		}
@@ -91,8 +94,7 @@ func (w *WalletService) List(f types.WalletFilter, page types.Pagination) (types
 		return types.Page[types.WalletResDto]{}, fmt.Errorf("count wallets: %w", err)
 	}
 	var rows []models.Wallet
-	err := q.Preload("Profile", selectProfileName).Preload("Merchant", selectProfileName).
-		Order("created_at DESC").Offset(page.Offset()).Limit(page.PageSize).Find(&rows).Error
+	err := w.withOwners(q).Order("wallets.created_at DESC").Offset(page.Offset()).Limit(page.PageSize).Find(&rows).Error
 	if err != nil {
 		return types.Page[types.WalletResDto]{}, fmt.Errorf("list wallets: %w", err)
 	}
@@ -194,15 +196,23 @@ func (w *WalletService) ValidateWallets(ids []uuid.UUID) (map[uuid.UUID]models.W
 		return nil, invalid("no wallets supplied")
 	}
 
-	byID := make(map[uuid.UUID]models.Wallet, len(ids))
-	missing := make([]uuid.UUID, 0, len(ids))
+	unique := make([]uuid.UUID, 0, len(ids))
+	keys := make([]string, 0, len(ids))
+	seen := make(map[uuid.UUID]bool, len(ids))
 	for _, id := range ids {
-		if _, dup := byID[id]; dup {
-			continue
+		if !seen[id] {
+			seen[id] = true
+			unique = append(unique, id)
+			keys = append(keys, cache.WalletMetaKey(id.String()))
 		}
-		var m walletMeta
-		if cache.Get(cache.WalletMetaKey(id.String()), &m) {
-			byID[id] = m.toWallet()
+	}
+
+	byID := make(map[uuid.UUID]models.Wallet, len(unique))
+	missing := make([]uuid.UUID, 0, len(unique))
+	metas, found := cache.GetMany[walletMeta](keys)
+	for i, id := range unique {
+		if found[i] {
+			byID[id] = metas[i].toWallet()
 		} else {
 			missing = append(missing, id)
 		}

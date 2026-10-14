@@ -1,7 +1,10 @@
 package servers
 
 import (
+	"log"
 	"net/http"
+	"os"
+	"runtime"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,7 +23,10 @@ func startHTTP(cfg *config.Config, gdb *gorm.DB, svc routers.Services) (*http.Se
 
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Logger)
+	r.Use(middleware.RequestLogger(&middleware.DefaultLogFormatter{
+		Logger:  log.New(logger.NewAsyncWriter(os.Stdout, 4096), "", log.LstdFlags),
+		NoColor: runtime.GOOS == "windows",
+	}))
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(30 * time.Second))
 	r.Use(cors.Handler(cors.Options{

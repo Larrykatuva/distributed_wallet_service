@@ -13,4 +13,3 @@ func ProfileUsernameKey(username string) string { return "profile:username:" + u
 func TransactionKey(id string) string         { return "txn:id:" + id }
 func TransactionRRNKey(rrn string) string     { return "txn:rrn:" + rrn }
 func TransactionOrderKey(order string) string { return "txn:order:" + order }
-func OrderUsedKey(order string) string        { return "txn:order-used:" + order }
